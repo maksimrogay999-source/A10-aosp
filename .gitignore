@@ -1,0 +1,25 @@
+# ---- Gradle / Android Studio ----
+.gradle/
+build/
+app/build/
+app/.cxx/
+.cxx/
+.externalNativeBuild/
+captures/
+local.properties
+*.iml
+.idea/
+
+# ---- Сгенерированные артефакты сборки ----
+# a10stub кладётся в assets post-build (CMakeLists.txt) — в репозитории не нужен
+app/src/main/assets/a10stub
+
+# ---- Логи прогона ----
+log.txt
+*.log
+
+# ---- Секреты/локальное ----
+*.keystore
+*.jks
+.DS_Store
+Thumbs.db
