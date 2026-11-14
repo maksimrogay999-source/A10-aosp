@@ -2,6 +2,7 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <limits.h>
 #include <linux/audit.h>
 #include <linux/filter.h>
 #include <linux/seccomp.h>
@@ -24,7 +25,11 @@
 #include <cstdlib>
 #include <string>
 
+#include "a10mounts.h"
+
 #define TAG "A10_Stub"
+
+// f_type эмулированного selinuxfs гостя (константа uapi ядра, linux/selinux.h).
 
 #ifndef SECCOMP_SET_MODE_FILTER
 #define SECCOMP_SET_MODE_FILTER 1
@@ -278,6 +283,333 @@ static void setup_guest_console(int console_fd, const char* mode_label) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "guest stdio -> console pipe fd=%d (%s)", console_fd, mode_label);
 }
 
+// ---------------------------------------------------------------- раскладка гостя
+// ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ. Эта таблица:
+//   * описывает, где лежит каждый путь гостя (host-путь);
+//   * из неё создаются каталоги и симлинки в rootfs;
+//   * из неё строится LD_LIBRARY_PATH и PATH гостя;
+//   * она записывается в <rootfs>/a10_mounts и передаётся гостю (A10_MOUNTS_FILE) —
+//     preload переводит пути по ней, без единого хардкода.
+//
+// host == nullptr  -> "<rootfs><guest>" (внутри гостевой ФС)
+// host == ""      -> путь хоста как есть ("/proc", "/sys", ...)
+// Флаги: rw, chmod_ok, console, selinux, magic=0xHEX, fallback=путь, logd,
+//        lib64, lib, bin, trace, dir (создать каталог), link=цель (симлинк).
+// Mount-таблица гостя. Списков путей в коде НЕТ: базовые записи — из СКАНА корня
+// гостевой ФС, точки монтирования и устройства — из mount()/mknod() гостя (preload
+// дописывает их в таблицу). Таблица живёт в <rootfs>/a10_mounts и передаётся гостю.
+struct LayoutEntry {
+    char guest[192];
+    char host[512];
+    char flags[256];
+};
+static LayoutEntry g_layout[256];
+static int g_layout_count = 0;
+
+// Добавить/обновить запись таблицы. Флаги ДОПОЛНЯЮТСЯ (ранее выставленные, напр. "trace",
+// не теряются при повторной регистрации каталога).
+static void layout_add(const char* guest, const char* host, const char* flags) {
+    for (int i = 0; i < g_layout_count; i++) {
+        if (strcmp(g_layout[i].guest, guest) == 0) {
+            snprintf(g_layout[i].host, sizeof(g_layout[i].host), "%s", host);
+            if (!flags || !flags[0]) return;
+            char add[256];
+            snprintf(add, sizeof(add), "%s", flags);
+            char* save = nullptr;
+            for (char* t = strtok_r(add, " \t", &save); t; t = strtok_r(nullptr, " \t", &save)) {
+                a10mount::Entry e {};
+                snprintf(e.flags, sizeof(e.flags), "%s", g_layout[i].flags);
+                if (a10mount::flag_present(&e, t)) continue;
+                size_t n = strlen(g_layout[i].flags);
+                snprintf(g_layout[i].flags + n, sizeof(g_layout[i].flags) - n, " %s", t);
+            }
+            return;
+        }
+    }
+    if (g_layout_count >= (int)(sizeof(g_layout) / sizeof(g_layout[0]))) return;
+    LayoutEntry& e = g_layout[g_layout_count++];
+    snprintf(e.guest, sizeof(e.guest), "%s", guest);
+    snprintf(e.host, sizeof(e.host), "%s", host);
+    snprintf(e.flags, sizeof(e.flags), "%s", flags ? flags : "");
+}
+
+// Самая длинная подходящая запись (префикс по границе компонента пути).
+static const LayoutEntry* layout_lookup(const char* guest_path) {
+    if (!guest_path) return nullptr;
+    const LayoutEntry* best = nullptr;
+    size_t bestlen = 0;
+    for (int i = 0; i < g_layout_count; i++) {
+        if (!a10mount::path_prefix(guest_path, g_layout[i].guest)) continue;
+        size_t gl = strlen(g_layout[i].guest);
+        if (gl > bestlen) {
+            bestlen = gl;
+            best = &g_layout[i];
+        }
+    }
+    return best;
+}
+
+// Перевод гостевого пути в host-путь по таблице.
+static bool guest_to_host(const char* guest_path, char* out, size_t outsz) {
+    const LayoutEntry* e = layout_lookup(guest_path);
+    if (!e) return false;
+    snprintf(out, outsz, "%s%s", e->host, guest_path + strlen(e->guest));
+    return true;
+}
+
+// Скан корня гостевой ФС -> базовые записи таблицы.
+//
+// Симлинк гостя (напр. "/product" -> "/system/product") НЕ должен уводить в корень
+// ХОСТА: иначе линкер гостя подхватит хостовые библиотеки (libbase AOSP-16 вместо
+// гостевого) — это и есть «shared с хостом». Поэтому цель симлинка переводится внутрь
+// гостевой ФС, а host-путь записи остаётся путём внутри rootfs.
+static void scan_guest_root(const char* rootfs) {
+    layout_add("/", rootfs, "rw");
+    DIR* d = opendir(rootfs);
+    if (!d) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "раскладка: не читается корень %s", rootfs);
+        return;
+    }
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        char guest[192], host[900];
+        snprintf(guest, sizeof(guest), "/%s", e->d_name);
+        snprintf(host, sizeof(host), "%s/%s", rootfs, e->d_name);
+        struct stat st {};
+        if (lstat(host, &st) == 0 && S_ISLNK(st.st_mode)) {
+            char target[512];
+            ssize_t n = readlink(host, target, sizeof(target) - 1);
+            if (n > 0) {
+                target[n] = 0;
+                if (target[0] == '/') {
+                    // Цель могла накопить префиксы rootfs за прошлые прогоны (перевод не
+                    // был идемпотентным) — отбрасываем их, получая исходный путь гостя.
+                    char clean[512];
+                    snprintf(clean, sizeof(clean), "%s", target);
+                    size_t rl = strlen(rootfs);
+                    while (rl && strncmp(clean, rootfs, rl) == 0) {
+                        memmove(clean, clean + rl, strlen(clean + rl) + 1);
+                    }
+                    char inside[900];
+                    snprintf(inside, sizeof(inside), "%s%s", rootfs, clean);
+                    unlink(host);
+                    if (strcmp(inside, host) == 0) {
+                        // Симлинк указывал сам на себя (остаток прошлых прогонов) — убираем.
+                        __android_log_print(ANDROID_LOG_INFO, TAG,
+                                            "раскладка: симлинк гостя %s (на себя) удалён", guest);
+                    } else if (symlink(inside, host) != 0) {
+                        __android_log_print(ANDROID_LOG_WARN, TAG, "symlink %s -> %s failed: %s",
+                                            host, inside, strerror(errno));
+                    } else {
+                        __android_log_print(ANDROID_LOG_INFO, TAG,
+                                            "раскладка: симлинк гостя %s -> %s (переведён внутрь гостя)",
+                                            guest, clean);
+                    }
+                }
+            }
+        }
+        layout_add(guest, host, "rw");
+    }
+    closedir(d);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "раскладка: просканирован корень гостя (%d записей)",
+                        g_layout_count);
+}
+
+// Таблица гостя -> файл <rootfs>/a10_mounts (его читает preload через A10_MOUNTS_FILE).
+static void write_mount_table(const char* rootfs, char* table_path, size_t sz) {
+    snprintf(table_path, sz, "%s/a10_mounts", rootfs);
+    FILE* f = fopen(table_path, "w");
+    if (!f) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "раскладка: не смог записать %s", table_path);
+        return;
+    }
+    fprintf(f, "# a10 mount table: <guest> <host> [flags]\n");
+    for (int i = 0; i < g_layout_count; i++) {
+        fprintf(f, "%s %s %s\n", g_layout[i].guest, g_layout[i].host, g_layout[i].flags);
+    }
+    fclose(f);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "раскладка гостя: %d записей -> %s", g_layout_count,
+                        table_path);
+    // Дамп таблицы: видно, что реально видит preload (диагностика путей гостя).
+    for (int i = 0; i < g_layout_count; i++) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "раскладка: %s -> %s [%s]", g_layout[i].guest,
+                            g_layout[i].host, g_layout[i].flags);
+    }
+}
+
+static void mkdir_p_host(const char* path);
+static void ensure_guest_dir(const char* guest_dir, const char* rootfs);
+static void ensure_guest_parent(const char* guest_file, const char* rootfs);
+static void layout_mark_trace(const char* guest);
+static void prepare_guest_product(const char* rootfs);
+
+// Пометить запись таблицы как трассируемую: обращения гостя к ней видны в логе.
+static void layout_mark_trace(const char* guest) {
+    for (int i = 0; i < g_layout_count; i++) {
+        if (strcmp(g_layout[i].guest, guest) != 0) continue;
+        a10mount::Entry e {};
+        snprintf(e.flags, sizeof(e.flags), "%s", g_layout[i].flags);
+        if (a10mount::flag_present(&e, "trace")) return;
+        size_t n = strlen(g_layout[i].flags);
+        snprintf(g_layout[i].flags + n, sizeof(g_layout[i].flags) - n, " trace");
+        return;
+    }
+}
+
+// product-раздела в GSI нет, но гостевая AOSP 10 сверяет product-пару sha
+// (FindPrecompiledSplitPolicy): без неё гость молча уходит из split-ветки ->
+// "Unable to load SELinux policy". Делаем гостевой /product (свой каталог) и
+// кладём СОГЛАСОВАННУЮ product-sha (копия plat-sha) — сравнение проходит.
+static void prepare_guest_product(const char* rootfs) {
+    char prod[700];
+    snprintf(prod, sizeof(prod), "%s/product", rootfs);
+    struct stat st {};
+    if (lstat(prod, &st) == 0 && S_ISLNK(st.st_mode)) {
+        // Симлинк гостя на отсутствующий product-раздел — заменяем своим каталогом.
+        unlink(prod);
+    }
+    ensure_guest_dir("/product", rootfs);
+    ensure_guest_dir("/product/etc/selinux", rootfs);
+    layout_mark_trace("/product/etc/selinux");
+
+    char plat_sha[700], prod_sha[700];
+    if (!guest_to_host("/system/etc/selinux/plat_sepolicy_and_mapping.sha256", plat_sha,
+                       sizeof(plat_sha)) ||
+        !guest_to_host("/product/etc/selinux/product_sepolicy_and_mapping.sha256", prod_sha,
+                       sizeof(prod_sha))) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: product-sha: пути не найдены в раскладке");
+        return;
+    }
+    struct stat pst {};
+    if (stat(prod_sha, &pst) == 0 && pst.st_size > 0) return;
+    int in = open(plat_sha, O_RDONLY);
+    if (in < 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: нет %s — product-sha не создана", plat_sha);
+        return;
+    }
+    char buf[512];
+    ssize_t n = read(in, buf, sizeof(buf));
+    close(in);
+    if (n <= 0) return;
+    int out = open(prod_sha, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (out >= 0) {
+        ssize_t w = write(out, buf, (size_t)n);
+        (void)w;
+        close(out);
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+                            "policy: гостевая product-sha создана (копия plat) -> %s", prod_sha);
+    }
+}
+
+// Эмулированный selinuxfs ГОСТЯ. Нужен ДО монтирования гостем: init первой стадии
+// делает statfs("/sys/fs/selinux") и по f_type решает, включён ли SELinux (на
+// устройстве selinuxfs поднят ядром с рождения, гость его только проверяет).
+// Позже гость сам монтирует selinuxfs — его mount() перезапишет эту запись (fs=selinuxfs).
+// Файловая система — ГОСТЕВАЯ (в rootfs), к selinuxfs хоста не обращаемся.
+static void register_guest_selinuxfs(const char* rootfs) {
+    const char* guest = "/sys/fs/selinux";
+    ensure_guest_dir("/sys/fs", rootfs);
+    char host[900];
+    snprintf(host, sizeof(host), "%s%s", rootfs, guest);
+    mkdir_p_host(host);
+    char flags[192];
+    snprintf(flags, sizeof(flags), "rw fs=selinuxfs selinux magic=0x%lx",
+             (unsigned long)0xf97cff8cUL);
+    layout_add(guest, host, flags);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "раскладка: эмулированный selinuxfs гостя -> %s", host);
+}
+
+// Каталог гостя: создаём в гостевой ФС и регистрируем в таблице (вместе с родителями).
+static void ensure_guest_dir(const char* guest_dir, const char* rootfs) {
+    char host[900];
+    snprintf(host, sizeof(host), "%s%s", rootfs, guest_dir);
+    mkdir_p_host(host);
+    char acc[256] = {0};
+    const char* p = guest_dir;
+    while (*p == '/') p++;
+    while (*p) {
+        const char* slash = strchr(p, '/');
+        size_t n = slash ? (size_t)(slash - p) : strlen(p);
+        if (acc[0]) {
+            snprintf(acc + strlen(acc), sizeof(acc) - strlen(acc), "/%.*s", (int)n, p);
+        } else {
+            snprintf(acc, sizeof(acc), "/%.*s", (int)n, p);
+        }
+        char h[900];
+        snprintf(h, sizeof(h), "%s%s", rootfs, acc);
+        layout_add(acc, h, "rw");
+        if (!slash) break;
+        p = slash + 1;
+    }
+}
+
+// Каталог гостя, в котором лежит файл: регистрируем и создаём.
+static void ensure_guest_parent(const char* guest_file, const char* rootfs) {
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s", guest_file);
+    char* slash = strrchr(tmp, '/');
+    if (!slash) return;
+    *slash = '\0';
+    ensure_guest_dir(tmp, rootfs);
+}
+
+// LD_LIBRARY_PATH гостя: каталоги lib/lib64, найденные в гостевой ФС (по таблице).
+// ТОЛЬКО внутри rootfs: хостовские библиотеки гостю не подсовываем.
+static void build_guest_ld_library_path(const char* rootfs, char* out, size_t outsz) {
+    size_t used = 0;
+    size_t rlen = rootfs ? strlen(rootfs) : 0;
+    out[0] = 0;
+    for (int i = 0; i < g_layout_count; i++) {
+        const LayoutEntry* e = &g_layout[i];
+        if (rlen && strncmp(e->host, rootfs, rlen) != 0) continue;
+        const char* subs[2] = {"/lib64", "/lib"};
+        for (int s = 0; s < 2; s++) {
+            char full[900];
+            snprintf(full, sizeof(full), "%s%s", e->host, subs[s]);
+            struct stat st {};
+            if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            size_t need = strlen(full) + (used ? 1 : 0) + 1;
+            if (used + need >= outsz) continue;
+            if (used) out[used++] = ':';
+            memcpy(out + used, full, strlen(full));
+            used += strlen(full);
+            out[used] = 0;
+        }
+    }
+}
+
+// PATH гостя: каталоги bin/sbin, найденные в гостевой ФС (по таблице).
+static void build_guest_path(char* out, size_t outsz) {
+    size_t used = 0;
+    out[0] = 0;
+    for (int i = 0; i < g_layout_count; i++) {
+        const LayoutEntry* e = &g_layout[i];
+        const char* subs[2] = {"/bin", "/sbin"};
+        for (int s = 0; s < 2; s++) {
+            char full[900];
+            snprintf(full, sizeof(full), "%s%s", e->host, subs[s]);
+            struct stat st {};
+            if (stat(full, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
+            char gp[256];
+            size_t gl = strlen(e->guest);
+            if (gl > 0 && e->guest[gl - 1] == '/') {
+                snprintf(gp, sizeof(gp), "%s%s", e->guest, subs[s] + 1);
+            } else {
+                snprintf(gp, sizeof(gp), "%s%s", e->guest, subs[s]);
+            }
+            size_t need = strlen(gp) + (used ? 1 : 0) + 1;
+            if (used + need >= outsz) continue;
+            if (used) out[used++] = ':';
+            memcpy(out + used, gp, strlen(gp));
+            used += strlen(gp);
+            out[used] = 0;
+        }
+    }
+}
+
+static void mkdir_p_host(const char* path);
+
 // Диагностика гостевой SELinux-ФС: какие политики/CIL/mapping есть в rootfs.
 // Политика должна быть ГОСТЕВОЙ (AOSP-10 GSI) — хостовую (AOSP-16) гостевой
 // libselinux распарсит неправильно.
@@ -291,7 +623,7 @@ static void report_guest_selinux(const char* rootfs) {
     };
     for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
         char p[700];
-        snprintf(p, sizeof(p), "%s%s", rootfs, dirs[i]);
+        if (!guest_to_host(dirs[i], p, sizeof(p))) continue;
         DIR* d = opendir(p);
         if (!d) {
             __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-diag: %s — каталога НЕТ", dirs[i]);
@@ -324,7 +656,7 @@ static void report_guest_selinux(const char* rootfs) {
     };
     for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
         char fp[800];
-        snprintf(fp, sizeof(fp), "%s%s", rootfs, probe[i]);
+        if (!guest_to_host(probe[i], fp, sizeof(fp))) continue;
         struct stat st {};
         if (stat(fp, &st) == 0) {
             __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-probe: ЕСТЬ %s (%ld байт)", probe[i],
@@ -371,11 +703,20 @@ static void log_file_head(const char* path) {
 static bool run_secilc(const char* rootfs, const char* vers, const char* polvers,
                        const char* out_path, char* err, size_t errsz) {
     err[0] = '\0';
-    char cil[700], map[700], secilc[700], libs[800];
-    snprintf(cil, sizeof(cil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
-    snprintf(map, sizeof(map), "%s/system/etc/selinux/mapping/%s.cil", rootfs, vers);
-    snprintf(secilc, sizeof(secilc), "%s/system/bin/secilc", rootfs);
-    snprintf(libs, sizeof(libs), "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib", rootfs, rootfs);
+    char cil[700], map[700], secilc[700], libs[900];
+    char cil_g[220], map_g[220], secilc_g[220];
+    snprintf(cil_g, sizeof(cil_g), "/system/etc/selinux/plat_sepolicy.cil");
+    snprintf(map_g, sizeof(map_g), "/system/etc/selinux/mapping/%s.cil", vers);
+    snprintf(secilc_g, sizeof(secilc_g), "/system/bin/secilc");
+    if (!guest_to_host(cil_g, cil, sizeof(cil)) ||
+        !guest_to_host(map_g, map, sizeof(map)) ||
+        !guest_to_host(secilc_g, secilc, sizeof(secilc))) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: гостевые пути не найдены в раскладке");
+        return false;
+    }
+    char llp[800];
+    build_guest_ld_library_path(rootfs, llp, sizeof(llp));
+    snprintf(libs, sizeof(libs), "LD_LIBRARY_PATH=%s", llp);
 
     int pfd[2];
     if (pipe(pfd) != 0) return false;
@@ -417,11 +758,19 @@ static bool run_secilc(const char* rootfs, const char* vers, const char* polvers
 // Собираем гостевую политику: перебираем версии mapping (свежие -> старые) и числовые
 // версии политики (-c). Первая удачная сборка и есть результат.
 static bool compile_guest_policy(const char* rootfs) {
-    char cil[700], secilc[700], out[700], libs[800];
-    snprintf(cil, sizeof(cil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
-    snprintf(secilc, sizeof(secilc), "%s/system/bin/secilc", rootfs);
+    char cil[700], secilc[700], out[700], libs[900];
+    char cil_g[220], secilc_g[220];
+    snprintf(cil_g, sizeof(cil_g), "/system/etc/selinux/plat_sepolicy.cil");
+    snprintf(secilc_g, sizeof(secilc_g), "/system/bin/secilc");
+    if (!guest_to_host(cil_g, cil, sizeof(cil)) ||
+        !guest_to_host(secilc_g, secilc, sizeof(secilc))) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: гостевые пути не найдены в раскладке");
+        return false;
+    }
     snprintf(out, sizeof(out), "%s/sepolicy.new", rootfs);
-    snprintf(libs, sizeof(libs), "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib", rootfs, rootfs);
+    char llp[800];
+    build_guest_ld_library_path(rootfs, llp, sizeof(llp));
+    snprintf(libs, sizeof(libs), "LD_LIBRARY_PATH=%s", llp);
     (void)libs;
 
     if (access(cil, R_OK) != 0) {
@@ -435,7 +784,10 @@ static bool compile_guest_policy(const char* rootfs) {
 
     // Кандидаты mapping: читаем каталог и сортируем по убыванию.
     char mapdir[700];
-    snprintf(mapdir, sizeof(mapdir), "%s/system/etc/selinux/mapping", rootfs);
+    if (!guest_to_host("/system/etc/selinux/mapping", mapdir, sizeof(mapdir))) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: путь mapping не найден в раскладке");
+        return false;
+    }
     char vers[16][32];
     int nvers = 0;
     DIR* md = opendir(mapdir);
@@ -478,7 +830,9 @@ static bool compile_guest_policy(const char* rootfs) {
                 long sz = (stat(out, &sst) == 0) ? (long)sst.st_size : -1L;
                 if (sz > 0) {
                     char final[700];
-                    snprintf(final, sizeof(final), "%s/sepolicy", rootfs);
+                    if (!guest_to_host("/sepolicy", final, sizeof(final))) {
+                        snprintf(final, sizeof(final), "%s/sepolicy", rootfs);
+                    }
                     unlink(final);
                     rename(out, final);
                     __android_log_print(ANDROID_LOG_INFO, TAG,
@@ -502,18 +856,28 @@ static void mkdir_p_host(const char* path);
 //  * /vendor/etc/selinux/precompiled_sepolicy (+ sha) — чтобы гость (split-путь)
 //    нашёл готовую политику через FindPrecompiledSplitPolicy и НЕ звал secilc сам.
 static bool install_guest_policy(const char* rootfs, const char* src) {
-    char vdir[700];
-    snprintf(vdir, sizeof(vdir), "%s/vendor/etc/selinux", rootfs);
-    mkdir_p_host(vdir);
+    // Каталоги гостя под политику: создаём и регистрируем в таблице.
+    ensure_guest_dir("/vendor/etc/selinux", rootfs);
+    layout_mark_trace("/vendor/etc/selinux");
+    ensure_guest_dir("/system/etc/selinux", rootfs);
+    layout_mark_trace("/system/etc/selinux");
 
-    const char* dsts[3];
-    char d1[700], d2[700], d3[700];
-    snprintf(d1, sizeof(d1), "%s/sepolicy", rootfs);
-    snprintf(d2, sizeof(d2), "%s/system/etc/selinux/precompiled_sepolicy", rootfs);
-    snprintf(d3, sizeof(d3), "%s/vendor/etc/selinux/precompiled_sepolicy", rootfs);
-    dsts[0] = d1;
-    dsts[1] = d2;
-    dsts[2] = d3;
+    // Куда кладём готовую политику (ГОСТЕВЫЕ пути -> host по раскладке).
+    // /vendor и /odm — стандартные места AOSP для precompiled-политики; в GSI их нет,
+    // поэтому делаем гостевые (иначе FindPrecompiledSplitPolicy гостя не находит).
+    const char* dsts_g[4] = {
+        "/sepolicy",
+        "/system/etc/selinux/precompiled_sepolicy",
+        "/vendor/etc/selinux/precompiled_sepolicy",
+        "/odm/etc/selinux/precompiled_sepolicy",
+    };
+    char dsts[4][700];
+    for (int i = 0; i < 4; i++) {
+        ensure_guest_parent(dsts_g[i], rootfs);
+        if (!guest_to_host(dsts_g[i], dsts[i], sizeof(dsts[i]))) {
+            snprintf(dsts[i], sizeof(dsts[i]), "%s", dsts_g[i]);
+        }
+    }
 
     int in = open(src, O_RDONLY);
     if (in < 0) {
@@ -539,7 +903,7 @@ static bool install_guest_policy(const char* rootfs, const char* src) {
     }
 
     bool ok = false;
-    for (int i = 0; i < 3; i++) {
+    for (int i = 0; i < 4; i++) {
         int out = open(dsts[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (out < 0) continue;
         ssize_t w = write(out, buf, got);
@@ -550,13 +914,38 @@ static bool install_guest_policy(const char* rootfs, const char* src) {
     }
     free(buf);
 
-    // sha-файл для FindPrecompiledSplitPolicy: должен совпасть с системным.
-    char srcsha[700], dstsha[700];
-    snprintf(srcsha, sizeof(srcsha), "%s/system/etc/selinux/plat_sepolicy_and_mapping.sha256", rootfs);
-    snprintf(dstsha, sizeof(dstsha),
-             "%s/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256", rootfs);
-    int si = open(srcsha, O_RDONLY);
-    if (si >= 0) {
+    // sha-файлы для FindPrecompiledSplitPolicy: гостю нужны пары plat и product.
+    // Если какой-то файл отсутствует, гость молча уходит из split-ветки -> "Unable to load
+    // SELinux policy" (лог 19:29). Значения копируем 1:1 из гостевой системы.
+    //
+    // product-раздела у GSI нет — готовим гостевой /product с согласованной product-sha
+    // (иначе FindPrecompiledSplitPolicy гостя не пройдёт: лог 00:00 "Unable to load
+    // SELinux policy").
+    prepare_guest_product(rootfs);
+    const char* sha_src_g[2] = {
+        "/system/etc/selinux/plat_sepolicy_and_mapping.sha256",
+        "/product/etc/selinux/product_sepolicy_and_mapping.sha256",
+    };
+    // Куда кладём пары: и в vendor, и в odm (гость ищет precompiled там, где есть раздел).
+    const char* sha_dst_g[4] = {
+        "/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+        "/vendor/etc/selinux/precompiled_sepolicy.product_sepolicy_and_mapping.sha256",
+        "/odm/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256",
+        "/odm/etc/selinux/precompiled_sepolicy.product_sepolicy_and_mapping.sha256",
+    };
+    for (int i = 0; i < 4; i++) {
+        int src_idx = i % 2;
+        ensure_guest_parent(sha_dst_g[i], rootfs);
+        char srcsha[700], dstsha[700];
+        if (!guest_to_host(sha_src_g[src_idx], srcsha, sizeof(srcsha)) ||
+            !guest_to_host(sha_dst_g[i], dstsha, sizeof(dstsha))) {
+            continue;
+        }
+        int si = open(srcsha, O_RDONLY);
+        if (si < 0) {
+            __android_log_print(ANDROID_LOG_WARN, TAG, "policy: нет %s — sha-пара неполная", srcsha);
+            continue;
+        }
         int so = open(dstsha, O_WRONLY | O_CREAT | O_TRUNC, 0644);
         if (so >= 0) {
             char buf[512];
@@ -569,6 +958,116 @@ static bool install_guest_policy(const char* rootfs, const char* src) {
         }
         close(si);
     }
+
+    // Проверка: vendor-пара должна совпадать с гостевой (иначе FindPrecompiledSplitPolicy
+    // гостя тихо вернёт false -> "Unable to load SELinux policy").
+    {
+        struct { const char* guest_actual; const char* guest_vendor; } pairs[2] = {
+            {"/system/etc/selinux/plat_sepolicy_and_mapping.sha256",
+             "/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256"},
+            {"/product/etc/selinux/product_sepolicy_and_mapping.sha256",
+             "/vendor/etc/selinux/precompiled_sepolicy.product_sepolicy_and_mapping.sha256"},
+        };
+        for (int i = 0; i < 2; i++) {
+            char pa[700], pv[700];
+            if (!guest_to_host(pairs[i].guest_actual, pa, sizeof(pa)) ||
+                !guest_to_host(pairs[i].guest_vendor, pv, sizeof(pv))) {
+                continue;
+            }
+            char ba[256] = {0}, bv[256] = {0};
+            int fa = open(pa, O_RDONLY);
+            int fv = open(pv, O_RDONLY);
+            if (fa >= 0) { ssize_t n = read(fa, ba, sizeof(ba) - 1); if (n < 0) n = 0; ba[n] = 0; close(fa); }
+            if (fv >= 0) { ssize_t n = read(fv, bv, sizeof(bv) - 1); if (n < 0) n = 0; bv[n] = 0; close(fv); }
+            if (ba[0] && bv[0] && strcmp(ba, bv) == 0) {
+                __android_log_print(ANDROID_LOG_INFO, TAG, "policy: sha-пара %d совпадает (%s)", i, ba);
+            } else {
+                __android_log_print(ANDROID_LOG_WARN, TAG,
+                                    "policy: sha-пара %d НЕ совпадает: actual='%s' vendor='%s'", i,
+                                    ba, bv);
+            }
+        }
+    }
+
+    // Версия mapping'а: на случай, если гость сам пойдёт в compile-ветку
+    // (GetVendorMappingVersion читает /vendor/etc/selinux/plat_sepolicy_vers.txt).
+    char vtxt[700];
+    if (guest_to_host("/vendor/etc/selinux/plat_sepolicy_vers.txt", vtxt, sizeof(vtxt))) {
+        int vf = open(vtxt, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (vf >= 0) {
+            const char* line = "29.0\n";
+            ssize_t w = write(vf, line, strlen(line));
+            (void)w;
+            close(vf);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "policy: версия mapping -> %s", vtxt);
+        }
+    }
+
+    // System-версия mapping'а: гость сверяет её с vendor-версией — если не совпали,
+    // он компилирует политику сам (ему нужен полный набор CIL).
+    char svers[700];
+    if (guest_to_host("/system/etc/selinux/plat_sepolicy_vers.txt", svers, sizeof(svers))) {
+        int sf = open(svers, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (sf >= 0) {
+            const char* line = "29.0\n";
+            ssize_t w = write(sf, line, strlen(line));
+            (void)w;
+            close(sf);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "policy: system-версия mapping -> %s", svers);
+        }
+    }
+
+    // Набор CIL для самостоятельной компиляции гостем: product/vendor/odm-разделов в GSI
+    // нет — делаем пустые секции + product-mapping (копия system-mapping) и
+    // versioned-public-политику (её гость тоже проверяет).
+    {
+        struct { const char* guest; const char* from; } cils[4] = {
+            {"/product/etc/selinux/product_sepolicy.cil", nullptr},
+            {"/vendor/etc/selinux/vendor_sepolicy.cil", nullptr},
+            {"/odm/etc/selinux/odm_sepolicy.cil", nullptr},
+            {"/vendor/etc/selinux/plat_pub_versioned.cil", nullptr},
+        };
+        for (int i = 0; i < 4; i++) {
+            ensure_guest_parent(cils[i].guest, rootfs);
+            char dst[700];
+            if (!guest_to_host(cils[i].guest, dst, sizeof(dst))) {
+                __android_log_print(ANDROID_LOG_WARN, TAG, "policy: путь %s не найден в раскладке",
+                                    cils[i].guest);
+                continue;
+            }
+            struct stat st {};
+            if (stat(dst, &st) == 0 && st.st_size > 0) continue;
+            int df = open(dst, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (df >= 0) {
+                close(df);
+                __android_log_print(ANDROID_LOG_INFO, TAG, "policy: пустая CIL-секция гостя -> %s", dst);
+            }
+        }
+        // product-mapping: копия system-mapping той же версии.
+        ensure_guest_dir("/product/etc/selinux/mapping", rootfs);
+        char pm[700], sm[700];
+        if (guest_to_host("/product/etc/selinux/mapping/29.0.cil", pm, sizeof(pm)) &&
+            guest_to_host("/system/etc/selinux/mapping/29.0.cil", sm, sizeof(sm))) {
+            struct stat st {};
+            if (stat(pm, &st) != 0) {
+                int in = open(sm, O_RDONLY);
+                if (in >= 0) {
+                    char buf[8192];
+                    ssize_t n;
+                    int out = open(pm, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+                    while (out >= 0 && (n = read(in, buf, sizeof(buf))) > 0) {
+                        if (write(out, buf, (size_t)n) <= 0) break;
+                    }
+                    if (out >= 0) close(out);
+                    close(in);
+                    __android_log_print(ANDROID_LOG_INFO, TAG, "policy: product-mapping гостя -> %s", pm);
+                }
+            }
+        }
+    }
+
+    // AOSP 10: FindPrecompiledSplitPolicy проверяет ДВЕ пары sha — plat и product.
+    // system_ext-пара нужна только в AOSP 11+ — гостю (AOSP 10) она не требуется.
     return ok;
 }
 
@@ -592,44 +1091,20 @@ static void prepare_guest_fs(const char* rootfs) {
     if (!rootfs || !rootfs[0]) return;
     char p[700];
 
-    const char* dirs[] = {"/dev", "/dev/pts", "/dev/socket", "/dev/block", "/dev/block/by-name",
-                          "/data", "/data/property", "/data/local", "/mnt", "/mnt/vendor",
-                          "/mnt/product", "/apex", "/debug_ramdisk", "/first_stage_ramdisk"};
-    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-        snprintf(p, sizeof(p), "%s%s", rootfs, dirs[i]);
-        mkdir_p_host(p);
-    }
-
-    // Симлинки на устройства хоста: цель абсолютная -> ядро хоста откроет настоящий узел.
-    // /dev/socket/logdw — сокет logd хоста: гостевой liblog сможет слать свои сообщения
-    // в системный лог (иначе сообщения гостя теряются, лог 14:45).
-    const char* links[][2] = {
-        {"/dev/null", "/dev/null"}, {"/dev/kmsg", "/dev/kmsg"}, {"/dev/urandom", "/dev/urandom"},
-        {"/dev/random", "/dev/random"}, {"/dev/ptmx", "/dev/ptmx"}, {"/dev/zero", "/dev/zero"},
-        {"/dev/full", "/dev/full"}, {"/dev/tty", "/dev/tty"},
-        {"/dev/socket/logdw", "/dev/socket/logdw"},
-    };
-    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
-        snprintf(p, sizeof(p), "%s%s", rootfs, links[i][0]);
-        unlink(p);
-        if (symlink(links[i][1], p) != 0) {
-            __android_log_print(ANDROID_LOG_WARN, TAG, "symlink %s -> %s failed: %s", p,
-                                links[i][1], strerror(errno));
-        }
-    }
-
-    // Политика: только ГОСТЕВАЯ. Порядок источников:
-    //   1) гостевая прекомпилированная (/system/etc/selinux/precompiled_sepolicy);
-    //   2) если plat_sepolicy.cil уже БИНАРНАЯ политика — она и есть готовая;
-    //   3) иначе собираем гостевым же secilc из гостевого CIL.
-    // Заглушку НЕ делаем: хостовую политику (AOSP-16) гостевой libselinux не разберёт.
+    // Каталоги и симлинки гостевой ФС создаёт build_guest_layout() по раскладке.
     report_guest_selinux(rootfs);
     char pol[700];
     char src[700];
     char vsrc[700];
-    snprintf(pol, sizeof(pol), "%s/sepolicy", rootfs);
-    snprintf(src, sizeof(src), "%s/system/etc/selinux/precompiled_sepolicy", rootfs);
-    snprintf(vsrc, sizeof(vsrc), "%s/vendor/etc/selinux/precompiled_sepolicy", rootfs);
+    if (!guest_to_host("/sepolicy", pol, sizeof(pol))) {
+        snprintf(pol, sizeof(pol), "%s/sepolicy", rootfs);
+    }
+    if (!guest_to_host("/system/etc/selinux/precompiled_sepolicy", src, sizeof(src))) {
+        snprintf(src, sizeof(src), "%s/system/etc/selinux/precompiled_sepolicy", rootfs);
+    }
+    if (!guest_to_host("/vendor/etc/selinux/precompiled_sepolicy", vsrc, sizeof(vsrc))) {
+        snprintf(vsrc, sizeof(vsrc), "%s/vendor/etc/selinux/precompiled_sepolicy", rootfs);
+    }
 
     // Остатки прошлых прогонов (в т.ч. ПУСТЫЕ файлы) не должны считаться политикой —
     // иначе гость получит нулевую политику. Чистим и всегда собираем заново при нужде.
@@ -643,7 +1118,9 @@ static void prepare_guest_fs(const char* rootfs) {
     }
 
     char platcil[700];
-    snprintf(platcil, sizeof(platcil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
+    if (!guest_to_host("/system/etc/selinux/plat_sepolicy.cil", platcil, sizeof(platcil))) {
+        snprintf(platcil, sizeof(platcil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
+    }
     log_file_head(platcil);
 
     bool installed = false;
@@ -691,7 +1168,8 @@ enum { PROBE_ERROR = -1, PROBE_NOT_LOADED = 0, PROBE_LOADED = 1, PROBE_HUNG = 2 
 static int run_ld_preload_probe(const char* label, const char* preload_path, const char* ok_file,
                                 int console_fd, int sup_sock,
                                 char* env_android_root, char* env_path, char* env_ld_library_path,
-                                const char* ld_debug_env, const char* rootfs_dir) {
+                                const char* ld_debug_env, const char* rootfs_dir,
+                                const char* mounts_file_env) {
     if (console_fd >= 0) {
         char m[640];
         int n = snprintf(m, sizeof(m), "=== LD_PRELOAD exec-probe %s: exec self with %s ===\n", label, preload_path);
@@ -723,7 +1201,13 @@ static int run_ld_preload_probe(const char* label, const char* preload_path, con
         if (rootfs_dir && rootfs_dir[0]) {
             snprintf(env_rootfs, sizeof(env_rootfs), "A10_ROOTFS=%s", rootfs_dir);
         }
-        char* pe[12];
+        // A10_MOUNTS_FILE: mount-таблица гостя (превод путей).
+        char env_mounts[800];
+        env_mounts[0] = 0;
+        if (mounts_file_env && mounts_file_env[0]) {
+            snprintf(env_mounts, sizeof(env_mounts), "A10_MOUNTS_FILE=%s", mounts_file_env);
+        }
+        char* pe[14];
         int ei = 0;
         pe[ei++] = env_android_root;
         pe[ei++] = env_path;
@@ -734,6 +1218,7 @@ static int run_ld_preload_probe(const char* label, const char* preload_path, con
         pe[ei++] = env_okfile;
         if (env_console[0]) pe[ei++] = env_console;
         if (env_rootfs[0]) pe[ei++] = env_rootfs;
+        if (env_mounts[0]) pe[ei++] = env_mounts;
         pe[ei] = nullptr;
         char* const pargv[] = { selfbuf, nullptr };
         execve(selfbuf, pargv, pe);
@@ -835,6 +1320,18 @@ int main(int argc, char** argv) {
     const char* rootfs_dir = (argc >= 3) ? argv[2] : "";
     __android_log_print(ANDROID_LOG_INFO, TAG, "target init=%s rootfs=%s", init_path, rootfs_dir);
 
+    // init бывает симлинком гостя ("/init" -> "/system/bin/init"): execve через симлинк
+    // упирается в ENOENT, поэтому резолвим путь в настоящий файл.
+    char init_real[PATH_MAX];
+    init_real[0] = 0;
+    if (realpath(init_path, init_real) != nullptr && init_real[0]) {
+        if (strcmp(init_real, init_path) != 0) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "init symlink resolved: %s -> %s", init_path,
+                                init_real);
+        }
+        init_path = init_real;
+    }
+
     struct stat st {};
     if (stat(init_path, &st) == 0) {
         __android_log_print(ANDROID_LOG_INFO, TAG, "init stat ok: mode=0%o size=%lld", (unsigned)st.st_mode, (long long)st.st_size);
@@ -888,25 +1385,52 @@ int main(int argc, char** argv) {
     for (int i = 3; i < argc; i++) gargv[gi++] = argv[i];
     gargv[gi] = nullptr;
 
-    // Базовое окружение для guest init: пути к библиотекам rootfs, чтобы linker нашёл зависимости.
-    char env_android_root[512];
-    snprintf(env_android_root, sizeof(env_android_root), "ANDROID_ROOT=%s/system", rootfs_dir && rootfs_dir[0] ? rootfs_dir : "/system");
-    char env_path[] = "PATH=/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin";
-
-    // LD_LIBRARY_PATH: библиотеки rootfs (64/32-bit), чтобы linker не падал на libbacktrace.so и др.
-    char env_ld_library_path[1024];
+    // ---- Раскладка гостя: скан корня гостевой ФС -> mount-таблица ----
+    // Таблица — единственный источник правды по путям: preload по ней переводит любой
+    // путь гостя, а гость сам дополняет её своими mount()/mknod().
+    char table_path[700];
+    table_path[0] = 0;
     if (rootfs_dir && rootfs_dir[0]) {
-        snprintf(env_ld_library_path, sizeof(env_ld_library_path),
-                 "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib:%s/lib64:%s/lib:%s/vendor/lib64:%s/vendor/lib",
-                 rootfs_dir, rootfs_dir, rootfs_dir, rootfs_dir, rootfs_dir, rootfs_dir);
-    } else {
-        snprintf(env_ld_library_path, sizeof(env_ld_library_path),
-                 "LD_LIBRARY_PATH=/system/lib64:/system/lib:/lib64:/lib:/vendor/lib64:/vendor/lib");
+        // Путь к таблице известен заранее — гость должен получить его в env ДО старта.
+        snprintf(table_path, sizeof(table_path), "%s/a10_mounts", rootfs_dir);
+        scan_guest_root(rootfs_dir);
     }
 
-    // Подготовка гостевой ФС: каталоги, симлинки на устройства хоста, политика /sepolicy.
+    // Базовое окружение для guest init: пути к библиотекам rootfs, чтобы linker нашёл
+    // зависимости. Всё строится по таблице (никаких путей «по умолчанию»).
+    char env_android_root[512];
+    char host_system[700];
+    if (rootfs_dir && rootfs_dir[0] && guest_to_host("/system", host_system, sizeof(host_system))) {
+        snprintf(env_android_root, sizeof(env_android_root), "ANDROID_ROOT=%s", host_system);
+    } else {
+        snprintf(env_android_root, sizeof(env_android_root), "ANDROID_ROOT=%s",
+                 rootfs_dir && rootfs_dir[0] ? rootfs_dir : "/system");
+    }
+    char guest_path[512];
+    build_guest_path(guest_path, sizeof(guest_path));
+    char env_path[600];
+    snprintf(env_path, sizeof(env_path), "PATH=%s", guest_path);
+
+    // LD_LIBRARY_PATH: библиотеки rootfs (64/32-bit), чтобы linker не падал на libbacktrace.so и др.
+    char guest_libpath[900];
+    build_guest_ld_library_path(rootfs_dir, guest_libpath, sizeof(guest_libpath));
+    char env_ld_library_path[1024];
+    snprintf(env_ld_library_path, sizeof(env_ld_library_path), "LD_LIBRARY_PATH=%s", guest_libpath);
+
+    // Таблица раскладки — гостю (preload читает её по A10_MOUNTS_FILE).
+    char env_mounts_file[800];
+    env_mounts_file[0] = 0;
+    if (table_path[0]) {
+        snprintf(env_mounts_file, sizeof(env_mounts_file), "A10_MOUNTS_FILE=%s", table_path);
+    }
+
+    // Подготовка гостевой ФС: политика гостя (/sepolicy и прекомпилированная).
     // Корнем гостя становится rootfs (cwd + A10_ROOTFS для preload'а).
     prepare_guest_fs(rootfs_dir);
+    // Таблица гостя — итоговая (после подготовки ФС): её читает preload (A10_MOUNTS_FILE).
+    if (rootfs_dir && rootfs_dir[0]) {
+        write_mount_table(rootfs_dir, table_path, sizeof(table_path));
+    }
     if (rootfs_dir && rootfs_dir[0]) {
         if (chdir(rootfs_dir) != 0) {
             __android_log_print(ANDROID_LOG_WARN, TAG, "chdir(%s) failed: %s", rootfs_dir, strerror(errno));
@@ -1007,13 +1531,15 @@ int main(int argc, char** argv) {
     if (cand_a[0]) {
         int r = run_ld_preload_probe("A", cand_a, ok_file_a, console_fd, sup_sock,
                                      env_android_root, env_path, env_ld_library_path,
-                                     want_ld_debug ? env_ld_debug : nullptr, rootfs_dir);
+                                     want_ld_debug ? env_ld_debug : nullptr, rootfs_dir,
+                                     env_mounts_file);
         if (r == PROBE_LOADED) snprintf(preload_path, sizeof(preload_path), "%s", cand_a);
     }
     if (!preload_path[0] && cand_b[0]) {
         int r = run_ld_preload_probe("B", cand_b, ok_file_b, console_fd, sup_sock,
                                      env_android_root, env_path, env_ld_library_path,
-                                     want_ld_debug ? env_ld_debug : nullptr, rootfs_dir);
+                                     want_ld_debug ? env_ld_debug : nullptr, rootfs_dir,
+                                     env_mounts_file);
         if (r == PROBE_LOADED) snprintf(preload_path, sizeof(preload_path), "%s", cand_b);
     }
     if (preload_path[0]) {
@@ -1043,7 +1569,7 @@ int main(int argc, char** argv) {
         snprintf(env_ld_preload, sizeof(env_ld_preload), "LD_PRELOAD=%s", preload_path);
     }
 
-    char* envp[12];
+    char* envp[14];
     int eic = 0;
     envp[eic++] = env_android_root;
     envp[eic++] = env_path;
@@ -1059,6 +1585,9 @@ int main(int argc, char** argv) {
     }
     if (env_rootfs[0]) {
         envp[eic++] = env_rootfs;
+    }
+    if (env_mounts_file[0]) {
+        envp[eic++] = env_mounts_file;
     }
     envp[eic] = nullptr;
 

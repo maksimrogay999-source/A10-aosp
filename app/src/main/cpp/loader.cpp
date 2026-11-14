@@ -250,6 +250,14 @@ pid_t loader_start_init() {
     __android_log_print(ANDROID_LOG_INFO, TAG, "Searching init in standard paths under %s", g_rootfs_dir.c_str());
     for (auto c : candidates) {
         std::string p = g_rootfs_dir + c;
+        // lstat: симлинки пропускаем. Гостевой "/init" — симлинк на "/system/bin/init";
+        // execve через него упирается в ENOENT, берём настоящий файл.
+        struct stat lst{};
+        int lrc = lstat(p.c_str(), &lst);
+        if (lrc == 0 && S_ISLNK(lst.st_mode)) {
+            __android_log_print(ANDROID_LOG_DEBUG, TAG, "candidate: %s is a symlink - skipped", p.c_str());
+            continue;
+        }
         struct stat st{};
         int rc = stat(p.c_str(), &st);
         if (rc == 0) {
