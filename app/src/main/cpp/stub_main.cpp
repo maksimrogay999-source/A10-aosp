@@ -277,6 +277,77 @@ static void setup_guest_console(int console_fd, const char* mode_label) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "guest stdio -> console pipe fd=%d (%s)", console_fd, mode_label);
 }
 
+// Подготовка гостевой ФС внутри rootfs: каталоги, симлинки на реальные устройства
+// хоста (абсолютные -> ядро откроет настоящий узел), монолитная SELinux-политика.
+static void mkdir_p_host(const char* path) {
+    char tmp[700];
+    snprintf(tmp, sizeof(tmp), "%s", path);
+    size_t n = strlen(tmp);
+    for (size_t i = 1; i < n; i++) {
+        if (tmp[i] == '/') {
+            tmp[i] = '\0';
+            mkdir(tmp, 0755);
+            tmp[i] = '/';
+        }
+    }
+    mkdir(tmp, 0755);
+}
+
+static void prepare_guest_fs(const char* rootfs) {
+    if (!rootfs || !rootfs[0]) return;
+    char p[700];
+
+    const char* dirs[] = {"/dev", "/dev/pts", "/dev/socket", "/dev/block", "/dev/block/by-name",
+                          "/data", "/data/property", "/data/local", "/mnt", "/mnt/vendor",
+                          "/mnt/product", "/apex", "/debug_ramdisk", "/first_stage_ramdisk"};
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        snprintf(p, sizeof(p), "%s%s", rootfs, dirs[i]);
+        mkdir_p_host(p);
+    }
+
+    // Симлинки на устройства хоста: цель абсолютная -> ядро хоста откроет настоящий узел.
+    const char* links[][2] = {
+        {"/dev/null", "/dev/null"}, {"/dev/kmsg", "/dev/kmsg"}, {"/dev/urandom", "/dev/urandom"},
+        {"/dev/random", "/dev/random"}, {"/dev/ptmx", "/dev/ptmx"}, {"/dev/zero", "/dev/zero"},
+        {"/dev/full", "/dev/full"}, {"/dev/tty", "/dev/tty"},
+    };
+    for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
+        snprintf(p, sizeof(p), "%s%s", rootfs, links[i][0]);
+        unlink(p);
+        if (symlink(links[i][1], p) != 0) {
+            __android_log_print(ANDROID_LOG_WARN, TAG, "symlink %s -> %s failed: %s", p,
+                                links[i][1], strerror(errno));
+        }
+    }
+
+    // Монолитная политика /sepolicy: без vendor-раздела split-политика недоступна,
+    // поэтому отдаём гостю precompiled-политику из его же system.
+    char pol[700];
+    char src[700];
+    snprintf(pol, sizeof(pol), "%s/sepolicy", rootfs);
+    snprintf(src, sizeof(src), "%s/system/etc/selinux/precompiled_sepolicy", rootfs);
+    int in = open(src, O_RDONLY);
+    int out = open(pol, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (in >= 0 && out >= 0) {
+        char buf[16384];
+        ssize_t n;
+        while ((n = read(in, buf, sizeof(buf))) > 0) {
+            ssize_t w = write(out, buf, (size_t)n);
+            if (w <= 0) break;
+        }
+        __android_log_print(ANDROID_LOG_INFO, TAG, "guest policy prepared: %s (from %s)", pol, src);
+    } else {
+        if (out >= 0) {
+            const char* dummy = "a10-emulated-policy\n";
+            ssize_t w = write(out, dummy, strlen(dummy));
+            (void)w;
+        }
+        __android_log_print(ANDROID_LOG_WARN, TAG, "precompiled policy not found (%s) - using stub policy", src);
+    }
+    if (in >= 0) close(in);
+    if (out >= 0) close(out);
+}
+
 // SIGSYS handler: force_sig (SECCOMP_RET_TRAP) доставляет его даже там, где SIG_IGN не
 // работает (лог 13:40: init умер на mount при SIG_IGN). Syscall при TRAP НЕ выполняется;
 // после возврата handler'а ядро возвращает -ENOSYS. Выживает через execve, наследуется init'ом.
@@ -307,7 +378,7 @@ enum { PROBE_ERROR = -1, PROBE_NOT_LOADED = 0, PROBE_LOADED = 1, PROBE_HUNG = 2 
 static int run_ld_preload_probe(const char* label, const char* preload_path, const char* ok_file,
                                 int console_fd, int sup_sock,
                                 char* env_android_root, char* env_path, char* env_ld_library_path,
-                                const char* ld_debug_env) {
+                                const char* ld_debug_env, const char* rootfs_dir) {
     if (console_fd >= 0) {
         char m[640];
         int n = snprintf(m, sizeof(m), "=== LD_PRELOAD exec-probe %s: exec self with %s ===\n", label, preload_path);
@@ -333,7 +404,13 @@ static int run_ld_preload_probe(const char* label, const char* preload_path, con
         if (console_fd >= 0) {
             snprintf(env_console, sizeof(env_console), "A10_CONSOLE_FD=%d", console_fd);
         }
-        char* pe[10];
+        // A10_ROOTFS: preload переводит пути гостя в корень гостевой ФС.
+        char env_rootfs[600];
+        env_rootfs[0] = 0;
+        if (rootfs_dir && rootfs_dir[0]) {
+            snprintf(env_rootfs, sizeof(env_rootfs), "A10_ROOTFS=%s", rootfs_dir);
+        }
+        char* pe[12];
         int ei = 0;
         pe[ei++] = env_android_root;
         pe[ei++] = env_path;
@@ -343,6 +420,7 @@ static int run_ld_preload_probe(const char* label, const char* preload_path, con
         pe[ei++] = env_label;
         pe[ei++] = env_okfile;
         if (env_console[0]) pe[ei++] = env_console;
+        if (env_rootfs[0]) pe[ei++] = env_rootfs;
         pe[ei] = nullptr;
         char* const pargv[] = { selfbuf, nullptr };
         execve(selfbuf, pargv, pe);
@@ -513,6 +591,22 @@ int main(int argc, char** argv) {
                  "LD_LIBRARY_PATH=/system/lib64:/system/lib:/lib64:/lib:/vendor/lib64:/vendor/lib");
     }
 
+    // Подготовка гостевой ФС: каталоги, симлинки на устройства хоста, политика /sepolicy.
+    // Корнем гостя становится rootfs (cwd + A10_ROOTFS для preload'а).
+    prepare_guest_fs(rootfs_dir);
+    if (rootfs_dir && rootfs_dir[0]) {
+        if (chdir(rootfs_dir) != 0) {
+            __android_log_print(ANDROID_LOG_WARN, TAG, "chdir(%s) failed: %s", rootfs_dir, strerror(errno));
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "guest root = %s (cwd)", rootfs_dir);
+        }
+    }
+    char env_rootfs[600];
+    env_rootfs[0] = 0;
+    if (rootfs_dir && rootfs_dir[0]) {
+        snprintf(env_rootfs, sizeof(env_rootfs), "A10_ROOTFS=%s", rootfs_dir);
+    }
+
     // ---- Кандидаты LD_PRELOAD ----
     // A: nativeLibDir APK (/data/app/~~.../lib/arm64) — useLegacyPackaging распаковывает.
     // B: rootfs lib64 (/data/.../files/aosp/lib64) — путь внутри LD_LIBRARY_PATH гостя.
@@ -600,13 +694,13 @@ int main(int argc, char** argv) {
     if (cand_a[0]) {
         int r = run_ld_preload_probe("A", cand_a, ok_file_a, console_fd, sup_sock,
                                      env_android_root, env_path, env_ld_library_path,
-                                     want_ld_debug ? env_ld_debug : nullptr);
+                                     want_ld_debug ? env_ld_debug : nullptr, rootfs_dir);
         if (r == PROBE_LOADED) snprintf(preload_path, sizeof(preload_path), "%s", cand_a);
     }
     if (!preload_path[0] && cand_b[0]) {
         int r = run_ld_preload_probe("B", cand_b, ok_file_b, console_fd, sup_sock,
                                      env_android_root, env_path, env_ld_library_path,
-                                     want_ld_debug ? env_ld_debug : nullptr);
+                                     want_ld_debug ? env_ld_debug : nullptr, rootfs_dir);
         if (r == PROBE_LOADED) snprintf(preload_path, sizeof(preload_path), "%s", cand_b);
     }
     if (preload_path[0]) {
@@ -636,7 +730,7 @@ int main(int argc, char** argv) {
         snprintf(env_ld_preload, sizeof(env_ld_preload), "LD_PRELOAD=%s", preload_path);
     }
 
-    char* envp[8];
+    char* envp[12];
     int eic = 0;
     envp[eic++] = env_android_root;
     envp[eic++] = env_path;
@@ -649,6 +743,9 @@ int main(int argc, char** argv) {
     }
     if (env_guest_console[0]) {
         envp[eic++] = env_guest_console;
+    }
+    if (env_rootfs[0]) {
+        envp[eic++] = env_rootfs;
     }
     envp[eic] = nullptr;
 
