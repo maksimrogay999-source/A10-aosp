@@ -8,7 +8,8 @@
 - Сборка — **только** `tools.Androidgradle.gradle_build_debug` / `gradle_clean` (shell `./gradlew` = permission denied). APK пользователь ставит сам, ставить за него нельзя.
 - Ответы — на русском. `log.txt` читать **только** по команде «читай лог»/«чекай лог» и **всегда целиком**.
 - **Никакого хардкода путей.** Пути гостя разрешаются ТОЛЬКО через mount-таблицу (`<rootfs>/a10_mounts`): стаб её собирает, preload по ней переводит любой путь. Списков путей в коде быть не должно; поведение задаётся флагами записи, а не «магическими» путями.
-- **Ничего общего у хоста и гостя:** `/proc`, `/sys`, `/dev/*`, selinuxfs, logd — всё эмулируется в гостевой ФС; хостовые `/system`, `/vendor`, сокет logd и устройства не используются.
+- **Идемпотентность перевода.** Корень гостя — `/data/data/…/aosp`, а гостевой путь `/data` тоже есть в таблице. Поэтому уже переведённый (host) путь повторно НЕ переводится (`lookup_guest()`): иначе `…/aosp/data/data/…` (и `ENOENT` при открытии).
+- **Ничего общего у хоста и гостя:** `/proc`, `/sys`, `/dev/*`, selinuxfs, logd — всё эмулируется в гостевой ФС; хостовые `/system`, `/vendor`, сокет logd, устройства и **selinuxfs хоста** не используются.
 - Никаких `ptrace` и бинарного патчинга. Номера syscall'ов сверять по документации/таблице, а не по памяти.
 
 ## Расположение
@@ -45,6 +46,8 @@
 - **Симлинки гостя**: цель переводится внутрь гостевой ФС; перевод идемпотентен (иначе пути разрастались `…/aosp/data/data/…/aosp/…` каждый прогон).
 - **Политика SELinux — гостевая** (AOSP 10 GSI), собирается гостевым же `secilc` (`plat_sepolicy.cil` + `mapping/29.0.cil`, `-c 31`) → 343 241 байт. Ставится в `/sepolicy`, `/system/etc/selinux/precompiled_sepolicy`, `/vendor/…`, `/odm/…` + sha-пары (plat+product) и `plat_sepolicy_vers.txt`.
 - **Политика гостя AOSP 10 требует**: `/system/etc/selinux/plat_sepolicy.cil`, `plat_sepolicy_and_mapping.sha256`, `/product/etc/selinux/product_sepolicy_and_mapping.sha256`, `/vendor/etc/selinux/precompiled_sepolicy{,.plat_sepolicy_and_mapping.sha256,.product_sepolicy_and_mapping.sha256}`, `plat_sepolicy_vers.txt` (совпадает с system-версией), а при самостоятельной компиляции — ещё `product_sepolicy.cil`, `product/etc/selinux/mapping/29.0.cil`, `vendor_sepolicy.cil`, `odm_sepolicy.cil`, `plat_pub_versioned.cil`.
+- **Виртуальные файлы** (procfs/selinuxfs) выдаются **по позиции**: содержимое генерируется один раз при `open()` и читается кусками, как обычный файл. Иначе гость читает одни и те же первые килобайты и не доходит до нужного контекста.
+- **Список контекстов гостя** (`/sys/fs/selinux/contexts`) собирается из гостевых файлов `*_contexts` (file/service/property/hwservice/seapp) — только значения вида `u:…`; SID-пространство своё (нумерация по списку).
 
 ## Что реализовано
 
@@ -81,23 +84,33 @@
 - Эмуляция: `mount`/`mknod` → регистрация в таблице; устройства по major/minor; selinuxfs (запись/ioctl успех, magic из таблицы); procfs-файлы; netlink → unix-socketpair; `clearenv` → восстановление окружения гостя.
 - Диагностика: `A10_FAIL(...)` на каждой ошибке + трассировка успешных `open/fopen/access` (до 400) + дамп таблицы при старте.
 
-## Где гость сейчас (состояние на 01:10)
+## Где гость сейчас (состояние на 01:47)
 
 | Стадия | Статус |
 |---|---|
 | 1. первая (`init`) | ✅ проходит: mount'ы /dev, /dev/pts, /proc, /sys, /sys/fs/selinux, /mnt, /apex, /debug_ramdisk; `mknod` устройств; `execv … second_stage` |
-| 2. `selinux_setup` | ✅ проходит: гостевая политика загружена, `execv … second_stage` |
-| 3. `second_stage` | ❌ падает: **«Failed to initialize property area»** — гостю не хватает `plat_file_contexts` (fopen не находит) и повторный `open(/dev/__properties__/property_info)` → `ENOENT` |
-| 4. property service / servicemanager | ⏳ не начато (дальше — **binder**, `/dev/binder` хоста намеренно не трогаем) |
+| 2. `selinux_setup` | ✅ проходит: гостевая политика записана в эмулированный selinuxfs (`/sys/fs/selinux/load`, 343 241 байт), enforce/checkreqprot; `execv … second_stage` |
+| 3. `second_stage` | ✅ **property area инициализировалась** (ошибки больше нет); ❌ падает на `restorecon("/system/bin/init")` → `ENOENT` |
+| 4. restorecon | ⏳ чинится: виртуальные файлы selinuxfs теперь выдаются **по позиции** (иначе гость читал одни и те же первые 16 КБ и не доходил до нужного контекста) |
+| 5. сервисы / servicemanager | ⏳ не начато (дальше — **binder**, `/dev/binder` хоста намеренно не трогаем) |
+
+### Разбор `restorecon failed of /system/bin/init: ENOENT` (01:47)
+- Правило в file_contexts **есть** (`/system/bin/init → u:object_r:init_exec:s0`, 541 строка), файл читается ✓.
+- Значит, падает проверка контекста: libselinux сверяет контекст со списком `/sys/fs/selinux/contexts`.
+- Причины и правки:
+  1. список контекстов собирался только из `*_property_contexts` — теперь из **всех** гостевых `*_contexts` (`plat_file_contexts`, `plat_service_contexts`, `plat_property_contexts`, `plat_hwservice_contexts`, `plat_seapp_contexts`), только значения вида `u:…`;
+  2. виртуальные файлы выдавались **всегда с начала** — теперь содержимое генерируется один раз при `open()` и выдаётся **по позиции** (буфер 256 КБ, кусками по 64 КБ);
+  3. `ioctl(SECURITY_CTX_TO_SID)` возвращает SID **по позиции контекста** в списке гостя; `SID_TO_CTX` — обратно.
 
 ## Следующие шаги
 
-1. **Property area:** обеспечить гостю `/system/etc/selinux/plat_file_contexts` (в GSI, похоже, только бинарный `.bin` или симлинк — стаб должен привести к текстовому/рабочему виду); разобраться с повторным `open("/dev/__properties__/property_info")` → `ENOENT` (кто удаляет файл) и с `memfd/ashmem`-созданием persistent properties.
-2. **Binder:** второй стадии нужен `/dev/binder` — виртуальная реализация в `binder_emulator.cpp` (симлинк на хостовый binder НЕ создаём).
-3. **procfs:** минимальный набор файлов (`self/*`, `mounts`, `filesystems`) — эмулируется по `fs=proc`.
-4. **ueventd/netlink:** узлы `/dev/*` создаёт гость сам (mknod) — эмуляция работает; реальных uevent-событий нет.
-5. **Свойства:** init читает `/system/build.prop` (в rootfs есть) — проверить `ro.build.version.sdk` и прочие, иначе zygote/system_server не поднимутся.
-6. **SIGSYS-handler — выполнение syscall:** читать `si_call_addr`, декодировать, выполнять в host-контексте (сейчас для pkey_alloc подставляем 0, остальным возвращается `-ENOSYS`).
+1. **restorecon** — дождаться прогона с выдачей по позиции; если ENOENT останется — смотреть, какие файлы libselinux открывает (лог `open()` покажет).
+2. **init.rc** — в rootfs есть (`/init.rc` в корне гостевой ФС, в таблице есть); гость его проходит, но сервисы из него могут потребовать `/dev/binder` и системных свойств.
+3. **Binder:** второй стадии нужен `/dev/binder` — виртуальная реализация в `binder_emulator.cpp` (симлинк на хостовый binder НЕ создаём).
+4. **procfs:** минимальный набор файлов (`self/*`, `mounts`, `filesystems`) — эмулируется по `fs=proc`.
+5. **ueventd/netlink:** узлы `/dev/*` создаёт гость сам (mknod) — эмуляция работает; реальных uevent-событий нет.
+6. **Свойства:** init читает `/system/build.prop` (в rootfs есть) — проверить `ro.build.version.sdk` и прочие, иначе zygote/system_server не поднимутся.
+7. **SIGSYS-handler — выполнение syscall:** читать `si_call_addr`, декодировать, выполнять в host-контексте (сейчас для pkey_alloc подставляем 0, остальным возвращается `-ENOSYS`).
 
 ## История логов (ключевые этапы)
 
@@ -106,4 +119,6 @@
 - **21:20–22:00** — **mount-таблица**: пути гостя только через таблицу; symlink-цели внутрь гостя; `LD_LIBRARY_PATH` только внутри rootfs; `A10_MOUNTS_FILE` в env.
 - **23:39–00:38** — гость монтирует selinuxfs **сам**; эмуляция procfs (файлы `filesystems/mounts/cmdline`); `chmod("/proc/cmdline")` перестал падать; перехват `__openat` (fortify) — гость наконец читает свои файлы.
 - **00:48–01:04** — product-пара sha + гостевой `/odm`; system-версия mapping; пустые CIL-секции product/vendor/odm + product-mapping; **политика загрузилась, гость дошёл до `second_stage`**.
-- **01:10** — SIGSYS-handler перенесён в preload (переживает exec); `pkey_alloc` больше не убивает init; падение на **property area** (`plat_file_contexts` не найден).
+- **01:10** — SIGSYS-handler перенесён в preload (переживает exec); `pkey_alloc` больше не убивает init.
+- **01:18–01:33** — найден **двойной перевод** путей: корень гостя = `/data/data/…/aosp`, а гостевой путь `/data` тоже есть в таблице → host-путь переводился сам в себя (`…/aosp/data/data/…`). Исправлено через `lookup_guest()`: уже переведённый путь не переводится повторно.
+- **01:38–01:47** — `plat_file_contexts` читается ✓, **property area инициализировалась** ✓; барьер — `restorecon` (см. выше).

@@ -520,6 +520,85 @@ static void register_guest_selinuxfs(const char* rootfs) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "раскладка: эмулированный selinuxfs гостя -> %s", host);
 }
 
+// Симлинки внутри гостевой ФС (например file_contexts) могут вести в ФС ХОСТА —
+// тогда гость читает чужое (или ничего). Переводим цели внутрь гостевой ФС;
+// если цели внутри гостя нет — делаем пустой файл (гость прочитает пустоту).
+static void fix_guest_symlinks_in(const char* rootfs, const char* guest_dir) {
+    char dir[700];
+    if (!guest_to_host(guest_dir, dir, sizeof(dir))) return;
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] == '.') continue;
+        char fp[800];
+        snprintf(fp, sizeof(fp), "%s/%s", dir, e->d_name);
+        struct stat lst {};
+        if (lstat(fp, &lst) != 0 || !S_ISLNK(lst.st_mode)) continue;
+        char target[512];
+        ssize_t n = readlink(fp, target, sizeof(target) - 1);
+        if (n <= 0) continue;
+        target[n] = 0;
+        char inside[900];
+        snprintf(inside, sizeof(inside), "%s%s", rootfs, target);
+        struct stat ist {};
+        if (stat(inside, &ist) != 0) {
+            unlink(fp);
+            int fd = open(fp, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+            if (fd >= 0) close(fd);
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                                "selinux: %s/%s -> %s (цели в госте нет) — создан пустой файл",
+                                guest_dir, e->d_name, target);
+            continue;
+        }
+        unlink(fp);
+        if (symlink(inside, fp) != 0) {
+            __android_log_print(ANDROID_LOG_WARN, TAG, "symlink %s -> %s failed: %s", fp, inside,
+                                strerror(errno));
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux: %s/%s -> %s (переведён внутрь гостя)",
+                                guest_dir, e->d_name, target);
+        }
+    }
+    closedir(d);
+}
+
+// Правило file_contexts для /system/bin/init: без него гость не может сделать
+// restorecon("/system/bin/init") (libselinux возвращает ENOENT -> init падает с
+// "restorecon failed"). Если правила в гостевом plat_file_contexts нет — дописываем
+// стандартный контекст AOSP.
+static void ensure_init_file_context(const char* rootfs) {
+    char path[700];
+    if (!guest_to_host("/system/etc/selinux/plat_file_contexts", path, sizeof(path))) return;
+    FILE* f = fopen(path, "r");
+    if (!f) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "file_contexts: нет %s", path);
+        return;
+    }
+    char line[1024];
+    int lines = 0;
+    bool found = false;
+    while (fgets(line, sizeof(line), f)) {
+        lines++;
+        if (!found && strstr(line, "/system/bin/init")) {
+            found = true;
+            __android_log_print(ANDROID_LOG_INFO, TAG, "file_contexts: правило для init есть: %s", line);
+        }
+    }
+    fclose(f);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "file_contexts: %s — %d строк", path, lines);
+    if (found) return;
+    int out = open(path, O_WRONLY | O_APPEND);
+    if (out >= 0) {
+        const char* rule = "/system/bin/init u:object_r:init_exec:s0\n";
+        ssize_t w = write(out, rule, strlen(rule));
+        (void)w;
+        close(out);
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+                            "file_contexts: дописано правило для /system/bin/init -> %s", path);
+    }
+}
+
 // Каталог гостя: создаём в гостевой ФС и регистрируем в таблице (вместе с родителями).
 static void ensure_guest_dir(const char* guest_dir, const char* rootfs) {
     char host[900];
@@ -638,7 +717,30 @@ static void report_guest_selinux(const char* rootfs) {
             snprintf(fp, sizeof(fp), "%s/%s", p, e->d_name);
             struct stat st {};
             long sz = (stat(fp, &st) == 0) ? (long)st.st_size : -1L;
-            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-diag:    %s (%ld байт)", e->d_name, sz);
+            // Тип узла + цель симлинка: видно, куда гость уходит за файлом.
+            struct stat lst {};
+            char kind[64] = "файл";
+            if (lstat(fp, &lst) == 0 && S_ISLNK(lst.st_mode)) {
+                char tgt[400];
+                ssize_t n = readlink(fp, tgt, sizeof(tgt) - 1);
+                if (n > 0) {
+                    tgt[n] = 0;
+                    snprintf(kind, sizeof(kind), "симлинк -> %s", tgt);
+                } else {
+                    snprintf(kind, sizeof(kind), "симлинк");
+                }
+            }
+            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-diag:    %s (%ld байт, %s)", e->d_name,
+                                sz, kind);
+            // Проверка чтения: гость открывает эти файлы сам — если у нас не открывается,
+            // значит, дело в пути/правах.
+            FILE* probe = fopen(fp, "r");
+            if (!probe) {
+                __android_log_print(ANDROID_LOG_WARN, TAG, "selinux-diag:    %s — ОТКРЫТИЕ НЕ РАБОТАЕТ (errno=%d)",
+                                    e->d_name, errno);
+            } else {
+                fclose(probe);
+            }
             count++;
         }
         closedir(d);
@@ -1093,6 +1195,12 @@ static void prepare_guest_fs(const char* rootfs) {
 
     // Каталоги и симлинки гостевой ФС создаёт build_guest_layout() по раскладке.
     report_guest_selinux(rootfs);
+    // Симлинки гостя внутри /system/etc/selinux (file_contexts и др.) не должны вести
+    // в ФС хоста — иначе гость читает чужое (и получает ENOENT).
+    fix_guest_symlinks_in(rootfs, "/system/etc/selinux");
+    fix_guest_symlinks_in(rootfs, "/system/etc");
+    fix_guest_symlinks_in(rootfs, "/vendor/etc");
+    ensure_init_file_context(rootfs);
     char pol[700];
     char src[700];
     char vsrc[700];

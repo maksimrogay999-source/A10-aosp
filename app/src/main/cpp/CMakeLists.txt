@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 add_library(native-lib SHARED
     native-lib.cpp
-    engine_kernel.cpp
     binder_emulator.cpp
     graphics_bridge.cpp
     audio_bridge.cpp

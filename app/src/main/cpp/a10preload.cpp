@@ -339,9 +339,18 @@ static const Entry* lookup_mount(const char* path) {
     return best;
 }
 
+// Запись таблицы для пути ГОСТЯ. Для УЖЕ переведённого (host) пути возвращает
+// nullptr: такой путь повторно не переводится. Иначе корень гостя (он же /data/...)
+// налезал бы сам на себя: "/data/data/…/aosp/system/…" -> "<rootfs>/data/data/…".
+static const Entry* lookup_guest(const char* path) {
+    if (!path) return nullptr;
+    if (g_rootfs[0] && strncmp(path, g_rootfs, strlen(g_rootfs)) == 0) return nullptr;
+    return lookup_mount(path);
+}
+
 // Перевод гостевого пути в реальный по таблице. true — путь переведён.
 static bool translate(const char* p, char* out, size_t outsz) {
-    const Entry* e = lookup_mount(p);
+    const Entry* e = lookup_guest(p);
     if (!e) return false;
     snprintf(out, outsz, "%s%s", e->host, p + strlen(e->guest));
     return true;
@@ -437,7 +446,7 @@ static unsigned long magic_for_entry(const Entry* e) {
         char* slash = strrchr(acc, '/');
         if (!slash || slash == acc) break;
         *slash = '\0';
-        const Entry* p = lookup_mount(acc);
+        const Entry* p = lookup_guest(acc);
         if (p) {
             mg = magic_of(p);
             if (mg) return mg;
@@ -480,6 +489,76 @@ static void install_sigsys_handler() {
     if (sigaction(SIGSYS, &sa, nullptr) == 0) {
         plog("a10preload.so: SIGSYS-handler установлен (внутри init'а)");
     }
+}
+
+// Виртуальные файлы procfs/selinuxfs ГОСТЯ: содержимое эмулируется (procfs/selinuxfs
+// хоста — это shared, гостю он не принадлежит).
+enum ProcKind {
+    PROC_NONE = 0,
+    PROC_FILESYSTEMS,
+    PROC_MOUNTS,
+    PROC_CMDLINE,
+    SEL_ENFORCE,
+    SEL_STATUS,
+    SEL_CONTEXTS,
+};
+
+// Список SELinux-контекстов гостя: собирается из ГОСТЕВЫХ файлов "*_contexts"
+//// (file/service/property/hwservice/seapp) в гостевой ФС. Данные хоста не используются.
+static ssize_t build_guest_contexts(char* out, size_t outsz) {
+    size_t used = 0;
+    char seen[65536];
+    seen[0] = 0;
+    const char* dirs[3] = {"/system/etc/selinux", "/vendor/etc/selinux", "/product/etc/selinux"};
+    const char* suffix = "_contexts";
+    size_t sl = strlen(suffix);
+    for (int d = 0; d < 3; d++) {
+        char dir[700];
+        if (!host_path_of(dirs[d], dir, sizeof(dir))) continue;
+        DIR* dp = opendir(dir);
+        if (!dp) continue;
+        struct dirent* de;
+        while ((de = readdir(dp)) != nullptr) {
+            const char* name = de->d_name;
+            size_t nl = strlen(name);
+            if (nl <= sl || strcmp(name + nl - sl, suffix) != 0) continue;
+            char fp[900];
+            snprintf(fp, sizeof(fp), "%s/%s", dir, name);
+            FILE* f = fopen(fp, "r");
+            if (!f) continue;
+            char line[512];
+            while (fgets(line, sizeof(line), f)) {
+                char* sp = strchr(line, ' ');
+                if (!sp) continue;
+                while (*sp == ' ') sp++;
+                char* e = strpbrk(sp, " \t\r\n");
+                if (e) *e = 0;
+                if (!sp[0] || sp[0] == '#') continue;
+                // Значение — SELinux-контекст (u:object_r:xxx:s0).
+                if (strncmp(sp, "u:", 2) != 0) continue;
+                if (strstr(seen, sp)) continue;
+                size_t need = strlen(sp) + 2;
+                if (strlen(seen) + need >= sizeof(seen)) continue;
+                snprintf(seen + strlen(seen), sizeof(seen) - strlen(seen), "%s\n", sp);
+                int n = snprintf(out + used, outsz - used, "%s\n", sp);
+                if (n > 0) used += (size_t)n;
+            }
+            fclose(f);
+        }
+        closedir(dp);
+    }
+    return (ssize_t)used;
+}
+
+// Типы файлов procfs/selinuxfs гостя (по базовому имени файла внутри mount'а).
+static int proc_kind_of_name(const char* base) {
+    if (strcmp(base, "filesystems") == 0) return PROC_FILESYSTEMS;
+    if (strcmp(base, "mounts") == 0) return PROC_MOUNTS;
+    if (strcmp(base, "cmdline") == 0) return PROC_CMDLINE;
+    if (strcmp(base, "enforce") == 0) return SEL_ENFORCE;
+    if (strcmp(base, "status") == 0) return SEL_STATUS;
+    if (strcmp(base, "contexts") == 0) return SEL_CONTEXTS;
+    return PROC_NONE;
 }
 
 // ---------------------------------------------------------------- конструктор
@@ -573,6 +652,10 @@ static int g_track_fd[A10_TRACK_MAX];
 static int g_track_mount[A10_TRACK_MAX];
 static int g_track_kind[A10_TRACK_MAX];
 
+static char* g_virt_data[A10_TRACK_MAX];
+static size_t g_virt_len[A10_TRACK_MAX];
+static size_t g_virt_pos[A10_TRACK_MAX];
+
 // Виды эмулируемых устройств гостя (по номерам major/minor).
 enum DevKind {
     DEVK_PLAIN = 0,   // обычный узел гостевой ФС
@@ -614,6 +697,10 @@ static void track_add(int fd, int mount_index, int kind) {
 static void track_del(int fd) {
     for (int i = 0; i < A10_TRACK_MAX; i++) {
         if (g_track_fd[i] == fd) {
+            free(g_virt_data[i]);
+            g_virt_data[i] = nullptr;
+            g_virt_len[i] = 0;
+            g_virt_pos[i] = 0;
             g_track_fd[i] = 0;
             g_track_mount[i] = -1;
             g_track_kind[i] = DEVK_PLAIN;
@@ -640,8 +727,39 @@ static int dev_kind_of_fd(int fd) {
 // Виртуальные файлы procfs ГОСТЯ: содержимое эмулируется (procfs хоста — это shared,
 // гостю он не принадлежит). Тип ФС proc гость объявляет сам, через mount() — тогда
 // preload создаёт у него файлы procfs и подменяет их содержимое.
-enum ProcKind { PROC_NONE = 0, PROC_FILESYSTEMS, PROC_MOUNTS, PROC_CMDLINE };
 static int g_track_proc[A10_TRACK_MAX];
+
+// Содержимое виртуального файла (procfs/selinuxfs) генерируется ОДИН РАЗ при open()
+// и выдаётся по частям с позицией — как обычный файл. Иначе гость читает одни и те же
+// первые килобайты и не доходит до нужного контекста (было: restorecon -> ENOENT).
+static void track_set_virt(int fd, char* data, size_t len) {
+    for (int i = 0; i < A10_TRACK_MAX; i++) {
+        if (g_track_fd[i] != fd) continue;
+        free(g_virt_data[i]);
+        g_virt_data[i] = data;
+        g_virt_len[i] = len;
+        g_virt_pos[i] = 0;
+        return;
+    }
+}
+
+// Очередной кусок виртуального файла; nullptr — файл не виртуальный.
+static const char* track_take_virt(int fd, size_t* chunk) {
+    for (int i = 0; i < A10_TRACK_MAX; i++) {
+        if (g_track_fd[i] != fd || !g_virt_data[i]) continue;
+        size_t left = g_virt_len[i] - g_virt_pos[i];
+        size_t n = left < 65536 ? left : 65536;
+        if (n == 0) {
+            *chunk = 0;
+            return "";
+        }
+        const char* p = g_virt_data[i] + g_virt_pos[i];
+        g_virt_pos[i] += n;
+        *chunk = n;
+        return p;
+    }
+    return nullptr;
+}
 
 static void track_set_proc(int fd, int kind) {
     for (int i = 0; i < A10_TRACK_MAX; i++) {
@@ -731,7 +849,7 @@ static bool trace_slot() {
 // selinux (эмулированный selinuxfs), fs=<тип> (тип ФС), trace (диагностика).
 static int a10_open_common(int dirfd, const char* path, int flags, mode_t mode) {
     if (!path) { errno = EFAULT; return -1; }
-    const Entry* e = lookup_mount(path);
+    const Entry* e = lookup_guest(path);
     const int idx = e ? (int)(e - g_mounts) : -1;
 
     char host[900];
@@ -782,19 +900,40 @@ static int a10_open_common(int dirfd, const char* path, int flags, mode_t mode) 
     int fd = (int)syscall(__NR_openat, dirfd, use, flags, mode);
     if (fd >= 0) {
         track_add(fd, idx, DEVK_PLAIN);
-        // Виртуальные файлы procfs гостя: помечаем, чтобы read() отдавал эмуляцию.
-        if (flag_present(e, "procfs")) {
+        // Виртуальные файлы procfs/selinuxfs гостя: помечаем и ГОТОВИМ содержимое один раз —
+        // read() выдаёт его по позиции, как обычный файл.
+        if (flag_present(e, "procfs") || flag_present(e, "selinux")) {
             const char* base = strrchr(path, '/');
             base = base ? base + 1 : path;
-            int pk = PROC_NONE;
-            if (strcmp(base, "filesystems") == 0) pk = PROC_FILESYSTEMS;
-            else if (strcmp(base, "mounts") == 0) pk = PROC_MOUNTS;
-            else if (strcmp(base, "cmdline") == 0) pk = PROC_CMDLINE;
-            if (pk != PROC_NONE) track_set_proc(fd, pk);
+            int pk = proc_kind_of_name(base);
+            if (pk != PROC_NONE) {
+                track_set_proc(fd, pk);
+                size_t cap = 262144;
+                char* data = (char*)malloc(cap);
+                size_t len = 0;
+                if (data) {
+                    ssize_t n = 0;
+                    if (pk == PROC_FILESYSTEMS) n = build_guest_filesystems(data, cap);
+                    else if (pk == PROC_MOUNTS) n = build_guest_mounts(data, cap);
+                    else if (pk == PROC_CMDLINE) n = 0;
+                    else if (pk == SEL_ENFORCE) n = snprintf(data, cap, "0\n");
+                    else if (pk == SEL_STATUS) n = snprintf(data, cap, "permissive\n");
+                    else if (pk == SEL_CONTEXTS) n = build_guest_contexts(data, cap);
+                    len = n > 0 ? (size_t)n : 0;
+                }
+                track_set_virt(fd, data, len);
+            }
         }
     }
     if (fd < 0) {
+        // Диагностика: файл есть по faccessat, но openat даёт ENOENT — значит, путь
+        // указывает не туда (симлинк/исчезновение). Показываем, что видим.
+        struct stat sb {};
+        int sres = (int)syscall(__NR_newfstatat, AT_FDCWD, use, &sb, 0);
         A10_FAIL("open", path);
+        plog("A10_Preload:   open(%s) -> %s errno=%d; fstatat(%s)=%d size=%ld", path, use, errno,
+             use, sres, sres == 0 ? (long)sb.st_size : -1L);
+        return fd;
     } else if (flag_present(e, "trace") || trace_slot()) {
         plog("A10_Preload: open(%s) -> fd=%d", path, fd);
     }
@@ -967,7 +1106,7 @@ int statx(int dirfd, const char* pathname, int flags, unsigned int mask, struct 
 
 // Трассировка: печатаем только для mount'ов, помеченных в таблице (trace/selinux).
 static bool traced_mount(const char* path) {
-    const Entry* e = lookup_mount(path ? path : "");
+    const Entry* e = lookup_guest(path ? path : "");
     return e && (has_flag(e, "trace") || has_flag(e, "selinux"));
 }
 
@@ -1070,7 +1209,7 @@ static bool writable_target(const char* pathname, char* host, size_t hostsz) {
         snprintf(host, hostsz, "%s", pathname);
         return true;
     }
-    const Entry* e = lookup_mount(pathname);
+    const Entry* e = lookup_guest(pathname);
     if (!e) return false;
     if (!has_flag(e, "rw") && !has_flag(e, "chmod_ok")) return false;
     snprintf(host, hostsz, "%s%s", e->host, pathname + strlen(e->guest));
@@ -1138,7 +1277,11 @@ int unlink(const char* pathname) {
     }
     if (!real) { errno = ENOSYS; return -1; }
     int r = real(host);
-    if (r < 0) A10_FAIL("unlink", pathname);
+    if (r < 0) {
+        A10_FAIL("unlink", pathname);
+    } else {
+        plog("A10_Preload: unlink(%s) ok", pathname ? pathname : "?");
+    }
     return r;
 }
 
@@ -1152,7 +1295,11 @@ int unlinkat(int dirfd, const char* pathname, int flags) {
     }
     if (!real) { errno = ENOSYS; return -1; }
     int r = real(dirfd, host, flags);
-    if (r < 0) A10_FAIL("unlinkat", pathname);
+    if (r < 0) {
+        A10_FAIL("unlinkat", pathname);
+    } else {
+        plog("A10_Preload: unlinkat(%s) ok", pathname ? pathname : "?");
+    }
     return r;
 }
 
@@ -1213,7 +1360,13 @@ ssize_t readlink(const char* pathname, char* buf, size_t bufsiz) {
 }
 
 int chmod(const char* pathname, mode_t mode) {
-    const Entry* e = lookup_mount(pathname ? pathname : "");
+    // Уже переведённый (host) путь внутри гостевой ФС — chmod прямо по нему.
+    if (g_rootfs[0] && pathname && strncmp(pathname, g_rootfs, strlen(g_rootfs)) == 0) {
+        int r = (int)syscall(__NR_fchmodat, AT_FDCWD, pathname, mode);
+        if (r < 0) A10_FAIL("chmod", pathname);
+        return r;
+    }
+    const Entry* e = lookup_guest(pathname ? pathname : "");
     if (!e) {
         errno = ENOENT;
         A10_FAIL("chmod", pathname);
@@ -1244,7 +1397,13 @@ int fchmodat(int dirfd, const char* pathname, mode_t mode, int flags) {
 }
 
 int chown(const char* pathname, uid_t owner, gid_t group) {
-    const Entry* e = lookup_mount(pathname ? pathname : "");
+    // Уже переведённый (host) путь внутри гостевой ФС — chown прямо по нему.
+    if (g_rootfs[0] && pathname && strncmp(pathname, g_rootfs, strlen(g_rootfs)) == 0) {
+        int r = (int)syscall(__NR_fchownat, AT_FDCWD, pathname, owner, group, 0);
+        if (r < 0) A10_FAIL("chown", pathname);
+        return r;
+    }
+    const Entry* e = lookup_guest(pathname ? pathname : "");
     if (!e) {
         errno = ENOENT;
         A10_FAIL("chown", pathname);
@@ -1262,7 +1421,13 @@ int chown(const char* pathname, uid_t owner, gid_t group) {
 }
 
 int lchown(const char* pathname, uid_t owner, gid_t group) {
-    const Entry* e = lookup_mount(pathname ? pathname : "");
+    // Уже переведённый (host) путь внутри гостевой ФС — lchown прямо по нему.
+    if (g_rootfs[0] && pathname && strncmp(pathname, g_rootfs, strlen(g_rootfs)) == 0) {
+        int r = (int)syscall(__NR_fchownat, AT_FDCWD, pathname, owner, group, AT_SYMLINK_NOFOLLOW);
+        if (r < 0) A10_FAIL("lchown", pathname);
+        return r;
+    }
+    const Entry* e = lookup_guest(pathname ? pathname : "");
     if (!e) {
         errno = ENOENT;
         A10_FAIL("lchown", pathname);
@@ -1370,7 +1535,7 @@ int execv(const char* path, char* const argv[]) {
 
 int chdir(const char* path) {
     char host[900];
-    const Entry* e = lookup_mount(path ? path : "");
+    const Entry* e = lookup_guest(path ? path : "");
     if (e && strcmp(e->guest, "/") == 0) {
         plog("A10_Preload: chdir(/) -> %s (корень гостя)", e->host);
         return (int)syscall(__NR_chdir, e->host);
@@ -1464,19 +1629,37 @@ ssize_t write(int fd, const void* buf, size_t count) {
         dump_guest_log((const char*)buf, count);
     }
     if (fd <= 2) guest_out("[guest write]", fd, (const char*)buf, count);
+    // Трассировка обычных записей гостя (первые N): видно, что он пишет в property_info
+    // и в persistent properties.
+    if (fd > 2 && trace_slot()) {
+        plog("A10_Preload: write(fd=%d, %zu байт) -> ok", fd, count);
+    }
     return (ssize_t)syscall(__NR_write, fd, buf, count);
 }
 
 // Устройства гостя: null/zero/full/random/urandom — эмуляция по номерам major/minor.
 // К устройствам ХОСТА не обращаемся (ничего общего у хоста и гостя).
 ssize_t read(int fd, void* buf, size_t count) {
-    // Виртуальные файлы procfs гостя: содержимое эмулируем.
+    // Виртуальные файлы procfs/selinuxfs гостя: содержимое эмулируется и выдаётся
+    // по позиции (как обычный файл).
+    size_t vchunk = 0;
+    const char* vdata = track_take_virt(fd, &vchunk);
+    if (vdata) {
+        if (vchunk == 0) return 0;
+        size_t cp = vchunk < count ? vchunk : count;
+        memcpy(buf, vdata, cp);
+        return (ssize_t)cp;
+    }
     int pk = proc_kind_of_fd(fd);
     if (pk != PROC_NONE) {
-        char content[4096];
+        static char content[262144];
         ssize_t n = 0;
         if (pk == PROC_FILESYSTEMS) n = build_guest_filesystems(content, sizeof(content));
         else if (pk == PROC_MOUNTS) n = build_guest_mounts(content, sizeof(content));
+        else if (pk == PROC_CMDLINE) n = 0;
+        else if (pk == SEL_ENFORCE) n = snprintf(content, sizeof(content), "0\n");
+        else if (pk == SEL_STATUS) n = snprintf(content, sizeof(content), "permissive\n");
+        else if (pk == SEL_CONTEXTS) n = build_guest_contexts(content, sizeof(content));
         if (n <= 0) return 0;
         size_t cp = (size_t)n < count ? (size_t)n : count;
         memcpy(buf, content, cp);
@@ -1539,13 +1722,86 @@ ssize_t sendmsg(int fd, const struct msghdr* msg, int flags) {
     return real(fd, msg, flags);
 }
 
+// Кэш списка контекстов гостя + собственное SID-пространство (контекст <-> SID).
+static char g_ctx_cache[65536];
+static int g_ctx_count = 0;
+
+static void ensure_ctx_cache() {
+    if (g_ctx_count) return;
+    g_ctx_count = (int)build_guest_contexts(g_ctx_cache, sizeof(g_ctx_cache));
+}
+
+// SID гостя для контекста (нумерация с 1 — по порядку в списке контекстов гостя).
+static int guest_sid_for(const char* ctx) {
+    if (!ctx || !*ctx) return 1;
+    ensure_ctx_cache();
+    const char* p = g_ctx_cache;
+    int sid = 1;
+    while (*p) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (len == strlen(ctx) && strncmp(p, ctx, len) == 0) return sid;
+        sid++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return 1;
+}
+
+// Контекст гостя по SID.
+static const char* guest_ctx_for_sid(int sid) {
+    ensure_ctx_cache();
+    const char* p = g_ctx_cache;
+    int cur = 1;
+    while (*p) {
+        const char* nl = strchr(p, '\n');
+        size_t len = nl ? (size_t)(nl - p) : strlen(p);
+        if (cur == sid) {
+            static char buf[512];
+            size_t n = len < sizeof(buf) - 1 ? len : sizeof(buf) - 1;
+            memcpy(buf, p, n);
+            buf[n] = 0;
+            return buf;
+        }
+        cur++;
+        if (!nl) break;
+        p = nl + 1;
+    }
+    return "u:object_r:system_prop:s0";
+}
+
 int ioctl(int fd, unsigned long request, ...) {
     va_list ap;
     va_start(ap, request);
     void* arg = va_arg(ap, void*);
     va_end(ap);
     if (is_selinux_fd(fd)) {
-        plog("A10_Preload: ioctl on emulated selinuxfs fd=%d accepted", fd);
+        // Эмулированный selinuxfs гостя (политика в ядро ХОСТА не грузится — это было бы
+        // shared с телефоном; гостю отдаём собственные ответы).
+        //   SECURITY_CTX_TO_SID = 1: гость просит SID контекста -> отдаём свой SID;
+        //   SECURITY_SID_TO_CTX = 2: обратное преобразование.
+        if (request == 1 && arg) {
+            // SECURITY_CTX_TO_SID: arg = указатель на строку-контекст, результат ioctl = SID.
+            const char* ctx = *(const char* const*)arg;
+            long sid = (long)guest_sid_for(ctx);
+            plog("A10_Preload: ioctl(selinuxfs, CTX_TO_SID) -> sid=%ld", sid);
+            return (int)sid;
+        }
+        if (request == 2 && arg) {
+            struct SelinuxSidToCtx {
+                char* ctx;
+                uint32_t len;
+            };
+            SelinuxSidToCtx* p = (SelinuxSidToCtx*)arg;
+            if (p && p->ctx && p->len) {
+                const char* c = guest_ctx_for_sid((int)(uintptr_t)p->len);
+                size_t n = strlen(c) + 1;
+                if (n > p->len) n = p->len;
+                memcpy(p->ctx, c, n);
+            }
+            return 0;
+        }
+        plog("A10_Preload: ioctl on emulated selinuxfs fd=%d request=%lu accepted", fd, request);
         return 0;
     }
     return (int)syscall(__NR_ioctl, fd, request, arg);
@@ -1713,7 +1969,7 @@ int statfs(const char* path, struct statfs* buf) {
     if (!buf) { errno = EFAULT; return -1; }
     char host[900];
     const char* use = path;
-    const Entry* e = lookup_mount(path ? path : "");
+    const Entry* e = lookup_guest(path ? path : "");
     if (e) {
         snprintf(host, sizeof(host), "%s%s", e->host, path + strlen(e->guest));
         use = host;
