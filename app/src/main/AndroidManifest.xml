@@ -15,6 +15,9 @@
             </intent-filter>
         </activity>
 
+        <!-- DocumentsProvider.attachInfo ТРЕБУЕТ защиты MANAGE_DOCUMENTS (иначе SecurityException
+             при старте приложения). Это signature-разрешение: им владеет системный
+             DocumentsUI («Файлы»), поэтому корень виден именно в системном менеджере. -->
         <provider
             android:name=".AospDocumentsProvider"
             android:authorities="com.android.emulA10.documents"

@@ -25,27 +25,200 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/netlink.h>
 #include <sched.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mount.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timex.h>
 #include <sys/types.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
 #include <time.h>
 #include <unistd.h>
 
 extern char** environ;
 
+#ifndef AF_NETLINK
+#define AF_NETLINK 16
+#endif
+#ifndef SOL_NETLINK
+#define SOL_NETLINK 270
+#endif
+
+// ---------------------------------------------------------------- REAL_FN макрос
+#define REAL_FN(var, name, rettype, params)     \
+    static rettype (*var) params = nullptr;     \
+    if (!var) var = (rettype (*) params)dlsym(RTLD_NEXT, name)
+
 static int g_console_fd = -1;
 static char g_rootfs[512];
 static char g_policy[600];   // эмулированная SELinux-политика гостя (<rootfs>/sepolicy)
+// Сохраняем окружение гостя: init первой стадии делает clearenv() — без восстановления
+// LD_PRELOAD вторая стадия (selinux_setup) стартовала БЕЗ нашей эмуляции (лог 14:55).
+static char g_preload[1024];
+static char g_console_env[64];
+static char g_android_root[512];
+static char g_ld_library_path[1024];
+
+// ---------------------------------------------------------------- логи гостя
+// Гость (init) пишет сообщения через android::base -> __android_log_write -> гостевой
+// liblog -> сокет /dev/socket/logdw. В гостевом /dev этого сокета нет, и сообщение
+// ТЕРЯЛОСЬ (лог 14:36: init молча умирал на SIGABRT). Перехватываем запись и печатаем
+// в нашу консоль: так видно каждый LOG() гостя, включая LOG(FATAL) с текстом ошибки.
+static void console_raw(const char* buf, size_t n) {
+    if (g_console_fd < 0 || n == 0) return;
+    ssize_t wn = (ssize_t)syscall(__NR_write, g_console_fd, buf, n);
+    (void)wn;
+}
+
+// Ловим ВСЁ, что гость пишет в свои stdout/stderr — даже если fd уведён в /dev/null.
+// Иначе текст LOG(FATAL) теряется (лог 14:40: abort поймали, а текст — нет).
+static void guest_out(const char* prefix, int fd, const char* buf, size_t n) {
+    if (fd < 0 || fd > 3 || !buf || n == 0) return;
+    char tmp[400];
+    size_t len = n < sizeof(tmp) - 1 ? n : sizeof(tmp) - 1;
+    memcpy(tmp, buf, len);
+    for (size_t i = 0; i < len; i++) {
+        if (tmp[i] == '\n' || tmp[i] == '\r') tmp[i] = '|';
+        else if (tmp[i] < 32) tmp[i] = '.';
+    }
+    tmp[len] = '\0';
+    char out[520];
+    int m = snprintf(out, sizeof(out), "%s fd=%d: %s", prefix, fd, tmp);
+    if (m > 0) console_raw(out, (size_t)m);
+}
+
+extern "C" int __android_log_assert(const char* cond, const char* tag, const char* fmt, ...) {
+    char body[512];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    char buf[768];
+    int n = snprintf(buf, sizeof(buf), "[guest %s ASSERT] %s : %s", tag ? tag : "?", cond ? cond : "?",
+                     body);
+    if (n > 0) console_raw(buf, (size_t)n);
+    return 0;
+}
+
+extern "C" int __android_log_write(int prio, const char* tag, const char* text) {
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "[guest %s prio=%d] %s", tag ? tag : "?", prio,
+                     text ? text : "");
+    if (n > 0) console_raw(buf, (size_t)n);
+    return 0;
+}
+
+extern "C" int __android_log_print(int prio, const char* tag, const char* fmt, ...) {
+    char body[768];
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(body, sizeof(body), fmt, ap);
+    va_end(ap);
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "[guest %s prio=%d] %s", tag ? tag : "?", prio, body);
+    if (n > 0) console_raw(buf, (size_t)n);
+    return 0;
+}
+
+extern "C" int __android_log_vprint(int prio, const char* tag, const char* fmt, va_list ap) {
+    char body[768];
+    vsnprintf(body, sizeof(body), fmt, ap);
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "[guest %s prio=%d] %s", tag ? tag : "?", prio, body);
+    if (n > 0) console_raw(buf, (size_t)n);
+    return 0;
+}
+
+// Android передаёт сюда ТЕКСТ фатальной ошибки перед abort() (libbase -> DefaultAborter).
+// Это единственный надёжный источник сообщения гостя: его liblog шлёт в /dev/socket/logdw,
+// которого в гостевом /dev нет, и всё теряется (лог 14:45).
+extern "C" void android_set_abort_message(const char* message) {
+    char buf[1024];
+    int n = snprintf(buf, sizeof(buf), "[guest FATAL] %s", message ? message : "(empty)");
+    if (n > 0) console_raw(buf, (size_t)n);
+    REAL_FN(real, "android_set_abort_message", void, (const char*));
+    if (real) real(message);
+}
+
+// abort() гостя — печатаем маркер (текст LOG(FATAL) уже ушёл в __android_log_write).
+extern "C" void abort(void) {
+    console_raw("[guest] abort() вызван гостём\n", 32);
+    REAL_FN(real, "abort", void, (void));
+    if (real) real();
+    __builtin_unreachable();
+}
+
+// ---------------------------------------------------------------- виртуальный netlink
+// init первой стадии обязан создать NETLINK_KOBJECT_UEVENT-сокет и сделать bind() на
+// группу 1 (uevent_listener.cpp: UeventSocket::Create) — на хосте bind упирается в EPERM
+// (нужен CAP_NET_ADMIN) -> LOG(FATAL) "Could not open uevent socket" -> abort (лог 14:50).
+// Эмулируем: настоящий netlink-сокет (если создался) или unix-сокет вместо него;
+// bind/setsockopt для таких fd считаем успешными. Событий uevent не будет — но init
+// пройдёт дальше.
+#define A10_MAX_NETLINK 16
+static int g_netlink_fd[A10_MAX_NETLINK];
+
+static void mark_netlink(int fd) {
+    if (fd < 0) return;
+    for (int i = 0; i < A10_MAX_NETLINK; i++) {
+        if (g_netlink_fd[i] == 0) {
+            g_netlink_fd[i] = fd;
+            return;
+        }
+    }
+}
+
+static bool is_netlink_fd(int fd) {
+    for (int i = 0; i < A10_MAX_NETLINK; i++) {
+        if (g_netlink_fd[i] == fd) return true;
+    }
+    return false;
+}
+
+int socket(int domain, int type, int protocol) {
+    REAL_FN(real, "socket", int, (int, int, int));
+    if (!real) { errno = ENOSYS; return -1; }
+    int fd = real(domain, type, protocol);
+    if (domain != AF_NETLINK) return fd;
+    if (fd >= 0) {
+        mark_netlink(fd);
+        return fd;
+    }
+    // netlink-сокет создать не дали -> подменяем на unix-datagram (работает как «пустой»)
+    int p[2];
+    if (socketpair(AF_UNIX, SOCK_DGRAM, 0, p) == 0) {
+        mark_netlink(p[0]);
+        close(p[1]);
+        char msg[96];
+        int n = snprintf(msg, sizeof(msg), "A10_Preload: netlink-сокет заменён на unix-socketpair (fd=%d)\n", p[0]);
+        if (n > 0) console_raw(msg, (size_t)n);
+        return p[0];
+    }
+    return -1;
+}
+
+int bind(int fd, const struct sockaddr* addr, socklen_t len) {
+    REAL_FN(real, "bind", int, (int, const struct sockaddr*, socklen_t));
+    if (is_netlink_fd(fd)) return 0;   // bind на netlink-группу = EPERM на хосте
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(fd, addr, len);
+}
+
+int setsockopt(int fd, int level, int optname, const void* optval, socklen_t optlen) {
+    REAL_FN(real, "setsockopt", int, (int, int, int, const void*, socklen_t));
+    if (is_netlink_fd(fd) && level == SOL_NETLINK) return 0;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(fd, level, optname, optval, optlen);
+}
 
 // ---------------------------------------------------------------- вывод в консоль
 static void plog(const char* fmt, ...) {
@@ -95,6 +268,15 @@ static void __attribute__((constructor)) a10preload_init(void) {
     const char* rf = getenv("A10_ROOTFS");
     if (rf && *rf) snprintf(g_rootfs, sizeof(g_rootfs), "%s", rf);
     snprintf(g_policy, sizeof(g_policy), "%s/sepolicy", g_rootfs);
+
+    // Запоминаем переменные, которые init сотрёт через clearenv().
+    const char* pv = getenv("LD_PRELOAD");
+    if (pv) snprintf(g_preload, sizeof(g_preload), "%s", pv);
+    if (cf && *cf) snprintf(g_console_env, sizeof(g_console_env), "%s", cf);
+    const char* ar = getenv("ANDROID_ROOT");
+    if (ar) snprintf(g_android_root, sizeof(g_android_root), "%s", ar);
+    const char* llp = getenv("LD_LIBRARY_PATH");
+    if (llp) snprintf(g_ld_library_path, sizeof(g_ld_library_path), "%s", llp);
 
     // 1) ok-файл exec-пробы: ДОКАЗАТЕЛЬСТВО, что линкер загрузил preload при exec.
     //    Родитель-стаб поллит его каждые 20мс.
@@ -169,12 +351,11 @@ static bool is_selinux_path(const char* p) {
     return p && strncmp(p, "/sys/fs/selinux", 14) == 0;
 }
 
-// Путь с политикой: монолитная /sepolicy или precompiled_sepolicy гостя.
+// Путь с политикой: монолитный /sepolicy гостя (его собрал стаб из его же CIL).
+// Прекомпилированная политика гостя (/system/etc/selinux/precompiled_sepolicy) читается
+// как обычный файл — перехватывать её не нужно.
 static bool is_policy_path(const char* p) {
-    if (!p) return false;
-    if (strcmp(p, "/sepolicy") == 0) return true;
-    const char* tail = strstr(p, "precompiled_sepolicy");
-    return tail != nullptr;
+    return p && strcmp(p, "/sepolicy") == 0;
 }
 
 // ---------------------------------------------------------------- ФС: открытие
@@ -203,13 +384,17 @@ static int a10_open_common(int dirfd, const char* path, int flags, mode_t mode) 
         if (fd >= 0) return fd;
     }
 
-    // selinuxfs на хосте закрыт для приложения: отдаём /dev/null и помечаем fd,
-    // чтобы запись (загрузка политики, setenforce) считалась успешной.
+    // selinuxfs на хосте закрыт для записи, но ЧИТАТЬ его можно. Открываем настоящий
+    // /sys/fs/selinux/<name> (тогда fstatfs даст SELINUX_MAGIC и libselinux согласится
+    // грузить политику), а запись в него считаем успешной (write() по отмеченным fd).
     if (is_selinux_path(path)) {
-        int fd = (int)syscall(__NR_openat, AT_FDCWD, "/dev/null", O_RDWR, 0);
+        int fd = (int)syscall(__NR_openat, AT_FDCWD, path, flags & ~O_CREAT, mode);
+        if (fd < 0) {
+            fd = (int)syscall(__NR_openat, AT_FDCWD, "/dev/null", O_RDWR, 0);
+        }
         if (fd >= 0) {
             track_add(fd, 1);
-            plog("A10_Preload: %s -> emulated selinuxfs (writes are accepted)", path);
+            plog("A10_Preload: %s -> emulated selinuxfs (fd=%d, запись принимается)", path, fd);
         }
         return fd;
     }
@@ -232,6 +417,30 @@ int open(const char* pathname, int flags, ...) {
 }
 
 int openat(int dirfd, const char* pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return a10_open_common(dirfd, pathname, flags, mode);
+}
+
+// arm64-алиасы (LFS): гость вправе звать open64/openat64 — иначе он открывает
+// /dev/kmsg мимо нашего перехвата (лог 14:36: kmsg так и не открылся).
+int open64(const char* pathname, int flags, ...) {
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap;
+        va_start(ap, flags);
+        mode = (mode_t)va_arg(ap, int);
+        va_end(ap);
+    }
+    return a10_open_common(AT_FDCWD, pathname, flags, mode);
+}
+
+int openat64(int dirfd, const char* pathname, int flags, ...) {
     mode_t mode = 0;
     if (flags & O_CREAT) {
         va_list ap;
@@ -272,6 +481,40 @@ int fstatat(int dirfd, const char* pathname, struct stat* st, int flags) {
     return (int)syscall(__NR_newfstatat, dirfd, use ? use : "", st, flags);
 }
 
+// LFS-алиасы статистики — на LP64 struct stat64 совпадает с struct stat.
+int stat64(const char* pathname, struct stat64* st) {
+    REAL_FN(real, "stat64", int, (const char*, struct stat64*));
+    char host[800];
+    const char* use = pathname;
+    if (pathname && translate(pathname, host, sizeof(host))) use = host;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(use ? use : "", st);
+}
+
+int lstat64(const char* pathname, struct stat64* st) {
+    REAL_FN(real, "lstat64", int, (const char*, struct stat64*));
+    char host[800];
+    const char* use = pathname;
+    if (pathname && translate(pathname, host, sizeof(host))) use = host;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(use ? use : "", st);
+}
+
+int fstat64(int fd, struct stat64* st) {
+    REAL_FN(real, "fstat64", int, (int, struct stat64*));
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(fd, st);
+}
+
+int fstatat64(int dirfd, const char* pathname, struct stat64* st, int flags) {
+    REAL_FN(real, "fstatat64", int, (int, const char*, struct stat64*, int));
+    char host[800];
+    const char* use = pathname;
+    if (pathname && translate(pathname, host, sizeof(host))) use = host;
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(dirfd, use ? use : "", st, flags);
+}
+
 int statx(int dirfd, const char* pathname, int flags, unsigned int mask, struct statx* stx) {
     if (!stx) { errno = EFAULT; return -1; }
     char host[800];
@@ -282,16 +525,25 @@ int statx(int dirfd, const char* pathname, int flags, unsigned int mask, struct 
 
 int access(const char* pathname, int mode) {
     if (!pathname) { errno = EFAULT; return -1; }
-    // Гость без /vendor => политика не split-овая: монолитный путь (/sepolicy).
-    if (strcmp(pathname, "/system/etc/selinux/plat_sepolicy.cil") == 0) {
-        plog("A10_Preload: access(%s) -> ENOENT (эмуляция: нет split-политики)", pathname);
-        errno = ENOENT;
-        return -1;
-    }
     char host[800];
     const char* use = pathname;
     if (translate(pathname, host, sizeof(host))) use = host;
     return (int)syscall(__NR_faccessat, AT_FDCWD, use, mode);
+}
+
+// ---------------------------------------------------------------- dup2
+// init делает SetStdioToDevNull() ДО InitKernelLogging(): его stdout/stderr уходят в
+// /dev/null, и ранний LOG(FATAL) ("Init encountered errors...", "Unable to load SELinux
+// policy") теряется. Оставляем stdout/stderr гостя на консоли — так видно ВСЕ сообщения.
+int dup2(int oldfd, int newfd) {
+    REAL_FN(real, "dup2", int, (int, int));
+    if (!real) { errno = ENOSYS; return -1; }
+    if (g_console_fd >= 0 && (newfd == STDOUT_FILENO || newfd == STDERR_FILENO)) {
+        int r = real(g_console_fd, newfd);
+        plog("A10_Preload: dup2(fd=%d) -> stdout/stderr остаются на консоли гостя", oldfd);
+        return r;
+    }
+    return real(oldfd, newfd);
 }
 
 // ---------------------------------------------------------------- ФС: изменения
@@ -303,11 +555,6 @@ static bool writable_target(const char* pathname, char* host, size_t hostsz) {
     return false;
 }
 
-// Реальные функции libc — обходим собственные перехваты через RTLD_NEXT.
-#define REAL_FN(var, name, rettype, params)     \
-    static rettype (*var) params = nullptr;     \
-    if (!var) var = (rettype (*) params)dlsym(RTLD_NEXT, name)
-
 int mkdir(const char* pathname, mode_t mode) {
     REAL_FN(real, "mkdir", int, (const char*, mode_t));
     char host[800];
@@ -318,7 +565,15 @@ int mkdir(const char* pathname, mode_t mode) {
     }
     if (!real) { errno = ENOSYS; return -1; }
     int r = real(host, mode);
-    if (r < 0 && errno == EEXIST) return 0;   // mkdir -p семантика
+    if (r < 0 && errno == EEXIST) {
+        r = 0;   // mkdir -p семантика
+        plog("A10_Preload: mkdir %s ok (уже существует)", pathname ? pathname : "?");
+    } else if (r < 0) {
+        plog("A10_Preload: mkdir %s FAILED errno=%d (%s)", pathname ? pathname : "?", errno,
+             strerror(errno));
+    } else {
+        plog("A10_Preload: mkdir %s ok", pathname ? pathname : "?");
+    }
     return r;
 }
 
@@ -521,20 +776,27 @@ int chdir(const char* path) {
     return (int)syscall(__NR_chdir, use ? use : "");
 }
 
-// init делает clearenv() перед exec'ом второй стадии — восстанавливаем пути гостя,
-// иначе его бинарники не найдут свои библиотеки.
+// init делает clearenv() перед exec'ом второй стадии (selinux_setup) — восстанавливаем
+// окружение гостя. БЕЗ восстановления LD_PRELOAD вторая стадия стартует БЕЗ нашей
+// эмуляции и падает на SELinux (лог 14:55).
 int clearenv(void) {
     static int (*real)(void) = nullptr;
     if (!real) real = (int (*)(void))dlsym(RTLD_NEXT, "clearenv");
     int r = real ? real() : 0;
+    if (g_preload[0]) setenv("LD_PRELOAD", g_preload, 1);
+    if (g_console_env[0]) setenv("A10_CONSOLE_FD", g_console_env, 1);
+    if (g_rootfs[0]) setenv("A10_ROOTFS", g_rootfs, 1);
+    if (g_android_root[0]) setenv("ANDROID_ROOT", g_android_root, 1);
     if (g_rootfs[0]) {
         char libs[900];
         snprintf(libs, sizeof(libs),
                  "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib:%s/lib64:%s/lib:%s/vendor/lib64:%s/vendor/lib",
                  g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs, g_rootfs);
         setenv("LD_LIBRARY_PATH", libs + strlen("LD_LIBRARY_PATH="), 1);
-        setenv("PATH", "/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin", 1);
+    } else if (g_ld_library_path[0]) {
+        setenv("LD_LIBRARY_PATH", g_ld_library_path, 1);
     }
+    setenv("PATH", "/sbin:/system/sbin:/system/bin:/system/xbin:/vendor/bin", 1);
     return r;
 }
 
@@ -544,7 +806,19 @@ ssize_t write(int fd, const void* buf, size_t count) {
         plog("A10_Preload: write to emulated selinuxfs fd=%d accepted (%zu bytes)", fd, count);
         return (ssize_t)count;
     }
+    if (fd <= 2) guest_out("[guest write]", fd, (const char*)buf, count);
     return (ssize_t)syscall(__NR_write, fd, buf, count);
+}
+
+ssize_t writev(int fd, const struct iovec* iov, int iovcnt) {
+    if (fd <= 2) {
+        for (int i = 0; i < iovcnt; i++) {
+            guest_out("[guest writev]", fd, (const char*)iov[i].iov_base, iov[i].iov_len);
+        }
+    }
+    REAL_FN(real, "writev", ssize_t, (int, const struct iovec*, int));
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(fd, iov, iovcnt);
 }
 
 int ioctl(int fd, unsigned long request, ...) {
@@ -597,11 +871,13 @@ int mknod(const char* path, mode_t mode, dev_t dev) {
     const char* use = path;
     if (path && translate(path, host, sizeof(host))) use = host;
     // Узел хоста уже есть (/dev/null, /dev/kmsg...) — эмулируем успех.
-    if (use && syscall(__NR_faccessat, AT_FDCWD, use, F_OK, 0) == 0) return 0;
+    if (use && syscall(__NR_faccessat, AT_FDCWD, use, F_OK, 0) == 0) {
+        plog("A10_Preload: mknod %s ok (узел есть)", path ? path : "?");
+        return 0;
+    }
     plog("A10_Preload: mknod %s emulated (узла нет)", path ? path : "?");
     return 0;
-}
-int setgroups(size_t size, const gid_t* list) { return emulated_ok("setgroups", NULL); }
+}int setgroups(size_t size, const gid_t* list) { return emulated_ok("setgroups", NULL); }
 int setgid(gid_t gid) { return emulated_ok("setgid", NULL); }
 int setuid(uid_t uid) { return emulated_ok("setuid", NULL); }
 int setreuid(uid_t r, uid_t e) { return emulated_ok("setreuid", NULL); }
@@ -642,6 +918,23 @@ int statfs(const char* path, struct statfs* buf) {
     if (r == 0) plog("A10_Preload: statfs(%s) -> type=0x%lx", path ? path : "?",
                      (unsigned long)buf->f_type);
     return r;
+}
+
+// fstatfs: для эмулированного selinuxfs отдаём SELINUX_MAGIC. Иначе libselinux
+// (проверка is_selinuxfs(fd)) не признаёт наш /dev/null selinuxfs и отказывается
+// грузить политику -> "Unable to load SELinux policy" (лог 15:34).
+int fstatfs(int fd, struct statfs* buf) {
+    REAL_FN(real, "fstatfs", int, (int, struct statfs*));
+    if (is_selinux_fd(fd)) {
+        if (!buf) { errno = EFAULT; return -1; }
+        memset(buf, 0, sizeof(*buf));
+        buf->f_type = 0xf97cff8c;   // SELINUX_MAGIC
+        buf->f_bsize = 4096;
+        buf->f_namelen = 255;
+        return 0;
+    }
+    if (!real) { errno = ENOSYS; return -1; }
+    return real(fd, buf);
 }
 
 // uname: гость ожидает Android.

@@ -1,4 +1,5 @@
 #include <android/log.h>
+#include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <linux/audit.h>
@@ -277,6 +278,300 @@ static void setup_guest_console(int console_fd, const char* mode_label) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "guest stdio -> console pipe fd=%d (%s)", console_fd, mode_label);
 }
 
+// Диагностика гостевой SELinux-ФС: какие политики/CIL/mapping есть в rootfs.
+// Политика должна быть ГОСТЕВОЙ (AOSP-10 GSI) — хостовую (AOSP-16) гостевой
+// libselinux распарсит неправильно.
+static void report_guest_selinux(const char* rootfs) {
+    const char* dirs[] = {
+        "/system/etc/selinux",
+        "/system/etc/selinux/mapping",
+        "/vendor/etc/selinux",
+        "/odm/etc/selinux",
+        "/product/etc/selinux",
+    };
+    for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
+        char p[700];
+        snprintf(p, sizeof(p), "%s%s", rootfs, dirs[i]);
+        DIR* d = opendir(p);
+        if (!d) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-diag: %s — каталога НЕТ", dirs[i]);
+            continue;
+        }
+        __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-diag: %s — содержимое:", dirs[i]);
+        struct dirent* e;
+        int count = 0;
+        while ((e = readdir(d)) != nullptr && count < 80) {
+            if (e->d_name[0] == '.') continue;
+            char fp[800];
+            snprintf(fp, sizeof(fp), "%s/%s", p, e->d_name);
+            struct stat st {};
+            long sz = (stat(fp, &st) == 0) ? (long)st.st_size : -1L;
+            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-diag:    %s (%ld байт)", e->d_name, sz);
+            count++;
+        }
+        closedir(d);
+    }
+
+    const char* probe[] = {
+        "/system/etc/selinux/precompiled_sepolicy",
+        "/system/etc/selinux/plat_sepolicy.cil",
+        "/system/etc/selinux/file_contexts",
+        "/system/bin/secilc",
+        "/sepolicy",
+        "/vendor/etc/selinux/precompiled_sepolicy",
+        "/vendor/etc/selinux/plat_sepolicy_vers.txt",
+        "/vendor/etc/selinux/vendor_sepolicy.cil",
+    };
+    for (size_t i = 0; i < sizeof(probe) / sizeof(probe[0]); i++) {
+        char fp[800];
+        snprintf(fp, sizeof(fp), "%s%s", rootfs, probe[i]);
+        struct stat st {};
+        if (stat(fp, &st) == 0) {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-probe: ЕСТЬ %s (%ld байт)", probe[i],
+                                (long)st.st_size);
+        } else {
+            __android_log_print(ANDROID_LOG_INFO, TAG, "selinux-probe: НЕТ  %s", probe[i]);
+        }
+    }
+}
+
+// Бинарная SELinux-политика начинается с magic 0xf97cff8c (он же у selinuxfs).
+// Если plat_sepolicy.cil уже бинарная — её можно отдать гостю как есть, без secilc.
+static bool is_binary_policy(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return false;
+    unsigned char b[4] = {0, 0, 0, 0};
+    ssize_t n = read(fd, b, 4);
+    close(fd);
+    return n == 4 && b[0] == 0xf9 && b[1] == 0x7c && b[2] == 0xff && b[3] == 0x8c;
+}
+
+// Лог первых байт файла: отличить CIL-текст от бинарной политики.
+static void log_file_head(const char* path) {
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return;
+    unsigned char b[16];
+    ssize_t n = read(fd, b, sizeof(b));
+    close(fd);
+    if (n <= 0) return;
+    char hex[64], txt[24];
+    int hn = 0, tn = 0;
+    for (ssize_t i = 0; i < n && hn < 48; i++) {
+        hn += snprintf(hex + hn, sizeof(hex) - hn, "%02x", b[i]);
+        if (hn < (int)sizeof(hex) - 1) txt[tn++] = (b[i] >= 32 && b[i] < 127) ? (char)b[i] : '.';
+    }
+    txt[tn] = 0;
+    __android_log_print(ANDROID_LOG_INFO, TAG, "policy-head %s: [%s] '%s'%s", path, hex, txt,
+                        is_binary_policy(path) ? "  <-- БИНАРНАЯ политика" : "");
+}
+
+// Гостевой secilc с перехватом stderr (в лог) — собираем политику гостя.
+// ВАЖНО: -c это ЧИСЛОВАЯ версия политики (у гостевого secilc дефолт 31), а не версия
+// mapping'а ("29.0"). mapping-файл передаётся отдельным аргументом.
+static bool run_secilc(const char* rootfs, const char* vers, const char* polvers,
+                       const char* out_path, char* err, size_t errsz) {
+    err[0] = '\0';
+    char cil[700], map[700], secilc[700], libs[800];
+    snprintf(cil, sizeof(cil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
+    snprintf(map, sizeof(map), "%s/system/etc/selinux/mapping/%s.cil", rootfs, vers);
+    snprintf(secilc, sizeof(secilc), "%s/system/bin/secilc", rootfs);
+    snprintf(libs, sizeof(libs), "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib", rootfs, rootfs);
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return false;
+    pid_t pid = fork();
+    if (pid == 0) {
+        close(pfd[0]);
+        dup2(pfd[1], STDERR_FILENO);
+        dup2(pfd[1], STDOUT_FILENO);
+        close(pfd[1]);
+        setenv("LD_LIBRARY_PATH", libs + strlen("LD_LIBRARY_PATH="), 1);
+        // Аргументы — как в AOSP init (LoadSplitPolicy): plat, флаги, -c версия, mapping, -o, -f
+        if (polvers && polvers[0]) {
+            execl(secilc, secilc, cil, "-m", "-M", "true", "-G", "-N", "-c", polvers, map,
+                  "-o", out_path, "-f", "/dev/null", (char*)nullptr);
+        } else {
+            execl(secilc, secilc, cil, "-m", "-M", "true", "-G", "-N", map,
+                  "-o", out_path, "-f", "/dev/null", (char*)nullptr);
+        }
+        _exit(127);
+    }
+    close(pfd[1]);
+    size_t got = 0;
+    ssize_t n;
+    while (got < errsz - 1 && (n = read(pfd[0], err + got, errsz - 1 - got)) > 0) got += (size_t)n;
+    err[got] = '\0';
+    close(pfd[0]);
+    int st = 0;
+    waitpid(pid, &st, 0);
+    int code = WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+    for (size_t i = 0; i < got; i++) {
+        if (err[i] == '\n' || err[i] == '\r') err[i] = '|';
+    }
+    __android_log_print(code == 0 ? ANDROID_LOG_INFO : ANDROID_LOG_WARN, TAG,
+                        "policy: secilc -c %s mapping=%s exit=%d, вывод: %s",
+                        (polvers && polvers[0]) ? polvers : "(дефолт)", vers, code, err);
+    return code == 0;
+}
+
+// Собираем гостевую политику: перебираем версии mapping (свежие -> старые) и числовые
+// версии политики (-c). Первая удачная сборка и есть результат.
+static bool compile_guest_policy(const char* rootfs) {
+    char cil[700], secilc[700], out[700], libs[800];
+    snprintf(cil, sizeof(cil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
+    snprintf(secilc, sizeof(secilc), "%s/system/bin/secilc", rootfs);
+    snprintf(out, sizeof(out), "%s/sepolicy.new", rootfs);
+    snprintf(libs, sizeof(libs), "LD_LIBRARY_PATH=%s/system/lib64:%s/system/lib", rootfs, rootfs);
+    (void)libs;
+
+    if (access(cil, R_OK) != 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: нет %s — компилировать нечего", cil);
+        return false;
+    }
+    if (access(secilc, X_OK) != 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: нет %s — компилировать нечем", secilc);
+        return false;
+    }
+
+    // Кандидаты mapping: читаем каталог и сортируем по убыванию.
+    char mapdir[700];
+    snprintf(mapdir, sizeof(mapdir), "%s/system/etc/selinux/mapping", rootfs);
+    char vers[16][32];
+    int nvers = 0;
+    DIR* md = opendir(mapdir);
+    if (md) {
+        struct dirent* e;
+        while ((e = readdir(md)) != nullptr && nvers < 16) {
+            const char* dot = strrchr(e->d_name, '.');
+            if (!dot || strcmp(dot, ".cil") != 0) continue;
+            char v[32];
+            snprintf(v, sizeof(v), "%.*s", (int)(dot - e->d_name), e->d_name);
+            bool dup = false;
+            for (int i = 0; i < nvers; i++) if (strcmp(vers[i], v) == 0) dup = true;
+            if (!dup) snprintf(vers[nvers++], 32, "%s", v);
+        }
+        closedir(md);
+    }
+    for (int i = 0; i < nvers; i++) {
+        for (int j = i + 1; j < nvers; j++) {
+            if (strcmp(vers[j], vers[i]) > 0) {
+                char t[32];
+                snprintf(t, sizeof(t), "%s", vers[i]);
+                snprintf(vers[i], 32, "%s", vers[j]);
+                snprintf(vers[j], 32, "%s", t);
+            }
+        }
+    }
+    if (nvers == 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: нет mapping/*.cil — собрать нечего");
+        return false;
+    }
+
+    // Числовые версии политики: дефолт гостевого secilc (31) и соседние.
+    const char* polvers[] = {"31", "30", "29", "28", ""};
+    char err[1024];
+    for (int i = 0; i < nvers; i++) {
+        for (size_t p = 0; p < sizeof(polvers) / sizeof(polvers[0]); p++) {
+            unlink(out);
+            if (run_secilc(rootfs, vers[i], polvers[p], out, err, sizeof(err))) {
+                struct stat sst {};
+                long sz = (stat(out, &sst) == 0) ? (long)sst.st_size : -1L;
+                if (sz > 0) {
+                    char final[700];
+                    snprintf(final, sizeof(final), "%s/sepolicy", rootfs);
+                    unlink(final);
+                    rename(out, final);
+                    __android_log_print(ANDROID_LOG_INFO, TAG,
+                                        "policy: собрана ГОСТЕВАЯ политика (mapping=%s, -c %s, %ld байт) -> %s",
+                                        vers[i], polvers[p][0] ? polvers[p] : "(дефолт)", sz, final);
+                    return true;
+                }
+            }
+        }
+    }
+    unlink(out);
+    __android_log_print(ANDROID_LOG_WARN, TAG, "policy: собрать НЕ удалось (ни одна пара mapping/-c не подошла)");
+    return false;
+}
+
+static void mkdir_p_host(const char* path);
+
+// Ставит гостевую политику по всем путям, которые читает libselinux:
+//  * /sepolicy — монолитный путь (LoadMonolithicPolicy);
+//  * /system/etc/selinux/precompiled_sepolicy — стандартное место GSI;
+//  * /vendor/etc/selinux/precompiled_sepolicy (+ sha) — чтобы гость (split-путь)
+//    нашёл готовую политику через FindPrecompiledSplitPolicy и НЕ звал secilc сам.
+static bool install_guest_policy(const char* rootfs, const char* src) {
+    char vdir[700];
+    snprintf(vdir, sizeof(vdir), "%s/vendor/etc/selinux", rootfs);
+    mkdir_p_host(vdir);
+
+    const char* dsts[3];
+    char d1[700], d2[700], d3[700];
+    snprintf(d1, sizeof(d1), "%s/sepolicy", rootfs);
+    snprintf(d2, sizeof(d2), "%s/system/etc/selinux/precompiled_sepolicy", rootfs);
+    snprintf(d3, sizeof(d3), "%s/vendor/etc/selinux/precompiled_sepolicy", rootfs);
+    dsts[0] = d1;
+    dsts[1] = d2;
+    dsts[2] = d3;
+
+    int in = open(src, O_RDONLY);
+    if (in < 0) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: нет источника %s", src);
+        return false;
+    }
+    // Читаем источник ЦЕЛИКОМ в память: иначе первый же dst (тот же файл) с O_TRUNC
+    // обрезает то, что мы читаем (лог 15:32: «гостевая политика 0 байт»).
+    size_t cap = 1 << 20;
+    char* buf = (char*)malloc(cap);
+    if (!buf) {
+        close(in);
+        return false;
+    }
+    size_t got = 0;
+    ssize_t n;
+    while (got + 1 < cap && (n = read(in, buf + got, cap - got - 1)) > 0) got += (size_t)n;
+    close(in);
+    if (got == 0) {
+        free(buf);
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: источник %s пустой", src);
+        return false;
+    }
+
+    bool ok = false;
+    for (int i = 0; i < 3; i++) {
+        int out = open(dsts[i], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (out < 0) continue;
+        ssize_t w = write(out, buf, got);
+        close(out);
+        __android_log_print(ANDROID_LOG_INFO, TAG, "policy: гостевая политика %zu байт -> %s", got,
+                            dsts[i]);
+        if (w == (ssize_t)got && i == 0) ok = true;
+    }
+    free(buf);
+
+    // sha-файл для FindPrecompiledSplitPolicy: должен совпасть с системным.
+    char srcsha[700], dstsha[700];
+    snprintf(srcsha, sizeof(srcsha), "%s/system/etc/selinux/plat_sepolicy_and_mapping.sha256", rootfs);
+    snprintf(dstsha, sizeof(dstsha),
+             "%s/vendor/etc/selinux/precompiled_sepolicy.plat_sepolicy_and_mapping.sha256", rootfs);
+    int si = open(srcsha, O_RDONLY);
+    if (si >= 0) {
+        int so = open(dstsha, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (so >= 0) {
+            char buf[512];
+            ssize_t n;
+            while ((n = read(si, buf, sizeof(buf))) > 0) {
+                if (write(so, buf, (size_t)n) <= 0) break;
+            }
+            close(so);
+            __android_log_print(ANDROID_LOG_INFO, TAG, "policy: sha-файл -> %s", dstsha);
+        }
+        close(si);
+    }
+    return ok;
+}
+
 // Подготовка гостевой ФС внутри rootfs: каталоги, симлинки на реальные устройства
 // хоста (абсолютные -> ядро откроет настоящий узел), монолитная SELinux-политика.
 static void mkdir_p_host(const char* path) {
@@ -306,10 +601,13 @@ static void prepare_guest_fs(const char* rootfs) {
     }
 
     // Симлинки на устройства хоста: цель абсолютная -> ядро хоста откроет настоящий узел.
+    // /dev/socket/logdw — сокет logd хоста: гостевой liblog сможет слать свои сообщения
+    // в системный лог (иначе сообщения гостя теряются, лог 14:45).
     const char* links[][2] = {
         {"/dev/null", "/dev/null"}, {"/dev/kmsg", "/dev/kmsg"}, {"/dev/urandom", "/dev/urandom"},
         {"/dev/random", "/dev/random"}, {"/dev/ptmx", "/dev/ptmx"}, {"/dev/zero", "/dev/zero"},
         {"/dev/full", "/dev/full"}, {"/dev/tty", "/dev/tty"},
+        {"/dev/socket/logdw", "/dev/socket/logdw"},
     };
     for (size_t i = 0; i < sizeof(links) / sizeof(links[0]); i++) {
         snprintf(p, sizeof(p), "%s%s", rootfs, links[i][0]);
@@ -320,32 +618,47 @@ static void prepare_guest_fs(const char* rootfs) {
         }
     }
 
-    // Монолитная политика /sepolicy: без vendor-раздела split-политика недоступна,
-    // поэтому отдаём гостю precompiled-политику из его же system.
+    // Политика: только ГОСТЕВАЯ. Порядок источников:
+    //   1) гостевая прекомпилированная (/system/etc/selinux/precompiled_sepolicy);
+    //   2) если plat_sepolicy.cil уже БИНАРНАЯ политика — она и есть готовая;
+    //   3) иначе собираем гостевым же secilc из гостевого CIL.
+    // Заглушку НЕ делаем: хостовую политику (AOSP-16) гостевой libselinux не разберёт.
+    report_guest_selinux(rootfs);
     char pol[700];
     char src[700];
+    char vsrc[700];
     snprintf(pol, sizeof(pol), "%s/sepolicy", rootfs);
     snprintf(src, sizeof(src), "%s/system/etc/selinux/precompiled_sepolicy", rootfs);
-    int in = open(src, O_RDONLY);
-    int out = open(pol, O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (in >= 0 && out >= 0) {
-        char buf[16384];
-        ssize_t n;
-        while ((n = read(in, buf, sizeof(buf))) > 0) {
-            ssize_t w = write(out, buf, (size_t)n);
-            if (w <= 0) break;
+    snprintf(vsrc, sizeof(vsrc), "%s/vendor/etc/selinux/precompiled_sepolicy", rootfs);
+
+    // Остатки прошлых прогонов (в т.ч. ПУСТЫЕ файлы) не должны считаться политикой —
+    // иначе гость получит нулевую политику. Чистим и всегда собираем заново при нужде.
+    struct stat st0 {};
+    const char* leftovers[3] = {src, vsrc, pol};
+    for (int i = 0; i < 3; i++) {
+        if (stat(leftovers[i], &st0) == 0 && st0.st_size == 0) {
+            unlink(leftovers[i]);
+            __android_log_print(ANDROID_LOG_WARN, TAG, "policy: удалён пустой файл %s", leftovers[i]);
         }
-        __android_log_print(ANDROID_LOG_INFO, TAG, "guest policy prepared: %s (from %s)", pol, src);
-    } else {
-        if (out >= 0) {
-            const char* dummy = "a10-emulated-policy\n";
-            ssize_t w = write(out, dummy, strlen(dummy));
-            (void)w;
-        }
-        __android_log_print(ANDROID_LOG_WARN, TAG, "precompiled policy not found (%s) - using stub policy", src);
     }
-    if (in >= 0) close(in);
-    if (out >= 0) close(out);
+
+    char platcil[700];
+    snprintf(platcil, sizeof(platcil), "%s/system/etc/selinux/plat_sepolicy.cil", rootfs);
+    log_file_head(platcil);
+
+    bool installed = false;
+    if (access(src, R_OK) == 0) {
+        installed = install_guest_policy(rootfs, src);
+    }
+    if (!installed && is_binary_policy(platcil)) {
+        installed = install_guest_policy(rootfs, platcil);
+    }
+    if (!installed) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "policy: прекомпилированной нет — компилируем гостевым secilc");
+        if (compile_guest_policy(rootfs)) {
+            install_guest_policy(rootfs, pol);
+        }
+    }
 }
 
 // SIGSYS handler: force_sig (SECCOMP_RET_TRAP) доставляет его даже там, где SIG_IGN не

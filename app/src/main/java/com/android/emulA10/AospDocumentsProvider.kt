@@ -3,7 +3,6 @@ package com.android.emulA10
 import android.content.Context
 import android.database.Cursor
 import android.database.MatrixCursor
-import android.graphics.Point
 import android.os.CancellationSignal
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
@@ -15,8 +14,12 @@ import java.io.IOException
 
 /**
  * Провайдер документов, дающий доступ к rootfs AOSP через Storage Access Framework.
- * Корневой каталог: files/aosp (rootfs).
- * Позволяет просматривать/открывать файлы гостя через системные файловые менеджеры.
+ * Корневой каталог: files/aosp (rootfs гостя).
+ *
+ * ВАЖНО: провайдер ОБЯЗАН быть защищён android.permission.MANAGE_DOCUMENTS —
+ * этого требует DocumentsProvider.attachInfo (иначе SecurityException на старте
+ * приложения). Разрешение signature-уровня: им владеет системный DocumentsUI («Файлы»),
+ * поэтому корень виден именно там.
  */
 class AospDocumentsProvider : DocumentsProvider() {
 
@@ -26,15 +29,20 @@ class AospDocumentsProvider : DocumentsProvider() {
 
         private fun getRootFile(context: Context): File =
             File(context.filesDir, "aosp")
+
+        /** Расширения, которые удобно открывать текстовым редактором (политика SELinux — .cil). */
+        private val TEXT_EXT = setOf(
+            "cil", "txt", "prop", "rc", "conf", "cfg", "ini", "xml", "json",
+            "sh", "te", "cil", "contexts", "list", "log"
+        )
     }
 
     override fun onCreate(): Boolean = true
 
-    override fun queryRoots(
-        projection: Array<String>?
-    ): Cursor {
+    override fun queryRoots(projection: Array<String>?): Cursor {
         val result = MatrixCursor(arrayOf(
             DocumentsContract.Root.COLUMN_ROOT_ID,
+            DocumentsContract.Root.COLUMN_DOCUMENT_ID,
             "title",
             DocumentsContract.Root.COLUMN_FLAGS,
             DocumentsContract.Root.COLUMN_ICON
@@ -49,6 +57,7 @@ class AospDocumentsProvider : DocumentsProvider() {
 
         result.newRow().apply {
             add(DocumentsContract.Root.COLUMN_ROOT_ID, ROOT_DIR)
+            add(DocumentsContract.Root.COLUMN_DOCUMENT_ID, ROOT_DIR)
             add("title", "A10 Rootfs")
             add(DocumentsContract.Root.COLUMN_FLAGS, flags)
             add(DocumentsContract.Root.COLUMN_ICON, android.R.drawable.ic_menu_manage)
@@ -70,18 +79,12 @@ class AospDocumentsProvider : DocumentsProvider() {
             Document.COLUMN_LAST_MODIFIED
         ))
 
-        val flags = if (file.isDirectory) {
-            Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_REMOVE
-        } else {
-            Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_REMOVE
-        }
-
         result.newRow().apply {
             add(Document.COLUMN_DOCUMENT_ID, documentId)
             add(Document.COLUMN_DISPLAY_NAME, file.name)
             add(Document.COLUMN_MIME_TYPE, getMimeType(file))
             add(Document.COLUMN_SIZE, if (file.isFile) file.length() else 0L)
-            add(Document.COLUMN_FLAGS, flags)
+            add(Document.COLUMN_FLAGS, flagsFor(file))
             add(Document.COLUMN_LAST_MODIFIED, file.lastModified())
         }
         return result
@@ -106,24 +109,29 @@ class AospDocumentsProvider : DocumentsProvider() {
             Document.COLUMN_LAST_MODIFIED
         ))
 
-        val files = parentFile.listFiles()?.sortedBy { it.isFile } ?: emptyList()
+        val files = parentFile.listFiles()?.sortedWith(
+            compareBy<File>({ !it.isDirectory }, { it.name.lowercase() })
+        ) ?: emptyList()
         for (file in files) {
             val docId = getDocIdForFile(context, file)
-            val flags = if (file.isDirectory) {
-                Document.FLAG_DIR_SUPPORTS_CREATE or Document.FLAG_SUPPORTS_REMOVE
-            } else {
-                Document.FLAG_SUPPORTS_WRITE or Document.FLAG_SUPPORTS_REMOVE
-            }
             result.newRow().apply {
                 add(Document.COLUMN_DOCUMENT_ID, docId)
                 add(Document.COLUMN_DISPLAY_NAME, file.name)
                 add(Document.COLUMN_MIME_TYPE, getMimeType(file))
                 add(Document.COLUMN_SIZE, if (file.isFile) file.length() else 0L)
-                add(Document.COLUMN_FLAGS, flags)
+                add(Document.COLUMN_FLAGS, flagsFor(file))
                 add(Document.COLUMN_LAST_MODIFIED, file.lastModified())
             }
         }
         return result
+    }
+
+    /** Обязательно для флагa FLAG_SUPPORTS_IS_CHILD, иначе часть менеджеров не листает вложенные папки. */
+    override fun isChildDocument(parentDocumentId: String, documentId: String): Boolean {
+        val context = context ?: return false
+        val parent = getFileForDocId(context, parentDocumentId).canonicalFile
+        val child = getFileForDocId(context, documentId).canonicalFile
+        return child.path.startsWith(parent.path + File.separator)
     }
 
     override fun openDocument(
@@ -158,7 +166,11 @@ class AospDocumentsProvider : DocumentsProvider() {
         val context = context ?: throw FileNotFoundException("No context")
         val file = getFileForDocId(context, documentId)
         if (!file.exists()) throw FileNotFoundException("Not found: $documentId")
-        if (!file.delete()) throw IOException("Failed to delete: $documentId")
+        if (file.isDirectory) {
+            if (!file.deleteRecursively()) throw IOException("Failed to delete dir: $documentId")
+        } else if (!file.delete()) {
+            throw IOException("Failed to delete: $documentId")
+        }
     }
 
     override fun renameDocument(documentId: String, displayName: String): String? {
@@ -170,6 +182,16 @@ class AospDocumentsProvider : DocumentsProvider() {
         return getDocIdForFile(context, newFile)
     }
 
+    private fun flagsFor(file: File): Int = if (file.isDirectory) {
+        Document.FLAG_DIR_SUPPORTS_CREATE or
+                Document.FLAG_SUPPORTS_DELETE or
+                Document.FLAG_SUPPORTS_REMOVE
+    } else {
+        Document.FLAG_SUPPORTS_WRITE or
+                Document.FLAG_SUPPORTS_DELETE or
+                Document.FLAG_SUPPORTS_REMOVE
+    }
+
     private fun getDocIdForFile(context: Context, file: File): String {
         val rootFile = getRootFile(context)
         val relativePath = file.relativeTo(rootFile).path
@@ -178,16 +200,28 @@ class AospDocumentsProvider : DocumentsProvider() {
 
     private fun getFileForDocId(context: Context, docId: String): File {
         val rootFile = getRootFile(context)
-        return if (docId == ROOT_DIR) rootFile
-        else File(rootFile, docId.removePrefix("$ROOT_DIR/"))
+        if (docId == ROOT_DIR) return rootFile
+        var rel = docId
+        if (rel.startsWith("$ROOT_DIR/")) rel = rel.removePrefix("$ROOT_DIR/")
+        // Защита от выхода за пределы rootfs.
+        val file = File(rootFile, rel)
+        val rootPath = rootFile.canonicalPath
+        val filePath = file.canonicalPath
+        if (filePath != rootPath && !filePath.startsWith(rootPath + File.separator)) {
+            throw FileNotFoundException("Outside root: $docId")
+        }
+        return file
     }
 
     private fun getMimeType(file: File): String {
+        if (file.isDirectory) return Document.MIME_TYPE_DIR
+        val ext = file.name.substringAfterLast('.', "").lowercase()
         return when {
-            file.isDirectory -> Document.MIME_TYPE_DIR
-            file.name.endsWith(".img") -> "application/octet-stream"
-            file.name.endsWith(".so") -> "application/x-sharedlib"
-            file.name.endsWith(".apk") -> "application/vnd.android.package-archive"
+            ext in TEXT_EXT -> "text/plain"
+            ext == "img" -> "application/octet-stream"
+            ext == "so" -> "application/x-sharedlib"
+            ext == "apk" -> "application/vnd.android.package-archive"
+            ext == "cil" -> "text/plain"
             else -> "application/octet-stream"
         }
     }
