@@ -167,6 +167,33 @@ static void seccomp_supervisor_loop(int notify_fd) {
     __android_log_print(ANDROID_LOG_INFO, TAG, "supervisor: loop end handled=%d", handled);
 }
 
+// Дамп сообщений гостя из его kmsg-файла (после смерти гостя).
+// Сообщения init'а (LOG(INFO/ERROR)) идут в /dev/kmsg гостя; часть мимо перехвата
+// write (внутри libc stdio -> служебный __write) — там остаются все.
+static void dump_guest_kmsg() {
+    if (g_rootfs_dir.empty()) return;
+    std::string path = g_rootfs_dir + "/dev/kmsg";
+    FILE* f = fopen(path.c_str(), "r");
+    if (!f) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "guest-kmsg: %s не читается (errno=%d)", path.c_str(), errno);
+        return;
+    }
+    char line[700];
+    int shown = 0;
+    int total = 0;
+    while (fgets(line, sizeof(line), f)) {
+        total++;
+        if (shown >= 40) continue;   // пайп телефона ограничен — больше не пишем
+        if (line[0] == '\n') continue;
+        char cut[300];
+        snprintf(cut, sizeof(cut), "%s", line);
+        shown++;
+        __android_log_print(ANDROID_LOG_INFO, TAG, "guest-kmsg: %s", cut);
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "guest-kmsg: всего строк = %d (показано %d)", total, shown);
+    fclose(f);
+}
+
 static void start_console_reader_thread(int fd) {
     std::thread([fd]() {
         __android_log_print(ANDROID_LOG_INFO, TAG, "console reader: start (fd=%d) -> logcat tag=A10_Guest", fd);
@@ -191,6 +218,10 @@ static void start_console_reader_thread(int fd) {
             __android_log_print(ANDROID_LOG_WARN, TAG, "console reader: read failed errno=%d (%s)", errno, strerror(errno));
         }
         __android_log_print(ANDROID_LOG_INFO, TAG, "console reader: EOF (guest stdio closed / init exited)");
+        // Сообщения гостя (LOG(INFO/ERROR)) init пишет в /dev/kmsg; часть из них идёт
+        // мимо перехвата write (внутри libc stdio), поэтому после смерти гостя читаем
+        // его kmsg-файл — иначе мы не видим, что гость писал в этот прогон.
+        dump_guest_kmsg();
         g_guest_exited.store(true); // для UI: авто-переключение Start/Stop
         close(fd);
     }).detach();

@@ -1,4 +1,4 @@
-// a10mounts.h — ОБЩИЙ разбор mount-таблицы гостя.
+// mounts.h — ОБЩИЙ разбор mount-таблицы гостя (a10engine).
 //
 // ЕДИНЫЙ ИСТОЧНИК ПРАВДЫ ПО ПУТЯМ. Таблицу собирает стаб (stub_main.cpp) и кладёт
 // в файл <rootfs>/a10_mounts; preload читает её по env A10_MOUNTS_FILE.

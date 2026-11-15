@@ -14,6 +14,8 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/prctl.h>
+#include <sys/epoll.h>
+#include <sys/un.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -25,7 +27,7 @@
 #include <cstdlib>
 #include <string>
 
-#include "a10mounts.h"
+#include "mounts.h"
 
 #define TAG "A10_Stub"
 
@@ -439,6 +441,34 @@ static void write_mount_table(const char* rootfs, char* table_path, size_t sz) {
 }
 
 static void mkdir_p_host(const char* path);
+
+// Тест epoll в домене приложения: гость обязан регистрировать свои сокеты в epoll.
+// Если хост (seccomp) запрещает epoll_ctl — это блокер второй стадии, и его надо видеть.
+static void test_epoll_support() {
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    int r_bind = -1, r_listen = -1, r_ctl = -1;
+    int e = -1;
+    if (s >= 0) {
+        struct sockaddr_un un {};
+        un.sun_family = AF_UNIX;
+        snprintf(un.sun_path, sizeof(un.sun_path), "/dev/socket/a10_ep_test");
+        r_bind = bind(s, (struct sockaddr*)&un, sizeof(un));
+        r_listen = listen(s, 8);
+        e = epoll_create1(EPOLL_CLOEXEC);
+        struct epoll_event ev {};
+        ev.events = EPOLLIN;
+        ev.data.fd = s;
+        r_ctl = epoll_ctl(e, EPOLL_CTL_ADD, s, &ev);
+        __android_log_print(ANDROID_LOG_INFO, TAG,
+                            "epoll-test: socket=%d bind=%d listen=%d epoll_create=%d epoll_ctl=%d "
+                            "errno=%d (%s)",
+                            s, r_bind, r_listen, e, r_ctl, errno, strerror(errno));
+        if (e >= 0) close(e);
+        close(s);
+    } else {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "epoll-test: socket() не создался errno=%d", errno);
+    }
+}
 static void ensure_guest_dir(const char* guest_dir, const char* rootfs);
 static void ensure_guest_parent(const char* guest_file, const char* rootfs);
 static void layout_mark_trace(const char* guest);
@@ -1189,12 +1219,235 @@ static void mkdir_p_host(const char* path) {
     mkdir(tmp, 0755);
 }
 
+// Диагностика свойств гостя: файл property_info (гость сам его пишет — смотрим, что
+// именно он записал) и формат гостевого property_contexts (его читает libpropertyinfoparser).
+static void report_guest_properties(const char* rootfs) {
+    char dir[700];
+    snprintf(dir, sizeof(dir), "%s/dev/__properties__", rootfs);
+    DIR* d = opendir(dir);
+    if (!d) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "props-diag: каталога %s нет", dir);
+    } else {
+        struct dirent* e;
+        while ((e = readdir(d)) != nullptr) {
+            if (e->d_name[0] == '.') continue;
+            char fp[800];
+            snprintf(fp, sizeof(fp), "%s/%s", dir, e->d_name);
+            struct stat st {};
+            long sz = (stat(fp, &st) == 0) ? (long)st.st_size : -1L;
+            __android_log_print(ANDROID_LOG_INFO, TAG, "props-diag: %s — %ld байт", e->d_name, sz);
+            int fd = open(fp, O_RDONLY);
+            if (fd >= 0) {
+                unsigned char buf[64];
+                ssize_t n = read(fd, buf, sizeof(buf));
+                char hex[200];
+                int o = 0;
+                for (ssize_t i = 0; i < n && o < (int)sizeof(hex) - 4; i++) {
+                    o += snprintf(hex + o, sizeof(hex) - o, "%02x ", buf[i]);
+                }
+                __android_log_print(ANDROID_LOG_INFO, TAG, "props-diag: %s head: %s", e->d_name, hex);
+                close(fd);
+            }
+        }
+        closedir(d);
+    }
+
+    // Формат гостевого property_contexts: его парсит libpropertyinfoparser гостя —
+    // если формат не тот, список свойств пустеет и property_info получается пустым.
+    // Печатаем табы как <TAB>: видно, чем разделены имя и контекст.
+    char pc[800];
+    snprintf(pc, sizeof(pc), "%s/system/etc/selinux/plat_property_contexts", rootfs);
+    FILE* f = fopen(pc, "r");
+    if (!f) {
+        __android_log_print(ANDROID_LOG_WARN, TAG, "propctx-diag: %s не читается (errno=%d)", pc, errno);
+        return;
+    }
+    char line[600];
+    int shown = 0;
+    while (fgets(line, sizeof(line), f) && shown < 10) {
+        char vis[700];
+        int o = 0;
+        for (const char* s = line; *s && o < (int)sizeof(vis) - 8; s++) {
+            if (*s == '\t') { memcpy(vis + o, "<TAB>", 5); o += 5; }
+            else if (*s == '\n') break;
+            else vis[o++] = *s;
+        }
+        vis[o] = '\0';
+        __android_log_print(ANDROID_LOG_INFO, TAG, "propctx-diag: [%s]", vis);
+        shown++;
+    }
+    fclose(f);
+}
+
+static void scan_file_strings(const char* fp, const char* label, int limit);
+
+// Строки гостевой libpropertyinfoparser: показывают, ЧТО ждёт парсер от файла
+// property_contexts (формат, разделители, ошибки). По ним видно, почему список
+// свойств вышел пустым.
+static void report_guest_lib_strings(const char* rootfs, const char* needle) {
+    char libdir[800];
+    snprintf(libdir, sizeof(libdir), "%s/system/lib64", rootfs);
+    DIR* d = opendir(libdir);
+    if (!d) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "libstr: каталога %s нет", libdir);
+        return;
+    }
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (!strstr(e->d_name, needle)) continue;
+        char fp[900];
+        snprintf(fp, sizeof(fp), "%s/%s", libdir, e->d_name);
+        scan_file_strings(fp, e->d_name, 30);
+    }
+    closedir(d);
+}
+
+// Печать интересных строк из файла гостя (парсер property contexts статически слинкован
+// в бинарник init — его строки подскажут, какой формат он ждёт).
+static void scan_file_strings(const char* fp, const char* label, int limit) {
+    struct stat lst {};
+    if (lstat(fp, &lst) != 0 || !S_ISREG(lst.st_mode)) return;   // только обычные файлы
+    int fd = open(fp, O_RDONLY);
+    if (fd < 0) return;
+    size_t cap = 2 * 1024 * 1024;
+    char* data = (char*)malloc(cap);
+    ssize_t n = data ? read(fd, data, cap) : -1;
+    close(fd);
+    int printed = 0;
+    if (n > 0 && data) {
+        char run[256];
+        int rl = 0;
+        for (ssize_t i = 0; i <= n && printed < limit; i++) {
+            char c = (i < n) ? data[i] : 0;
+            if (c >= 32 && c < 127) {
+                if (rl < (int)sizeof(run) - 1) run[rl++] = c;
+            } else {
+                if (rl >= 5) {
+                    run[rl] = '\0';
+                    if (strstr(run, "nvalid") || strstr(run, "ormat") || strstr(run, "xpect") ||
+                        strstr(run, "rror") || strstr(run, "arse") || strstr(run, "trie") ||
+                        strstr(run, "separat") || strstr(run, "olumn") || strstr(run, "roperty ") ||
+                        strstr(run, "context ")) {
+                        printed++;
+                        __android_log_print(ANDROID_LOG_INFO, TAG, "libstr[%s]: %s", label, run);
+                    }
+                }
+                rl = 0;
+            }
+        }
+    }
+    free(data);
+}
+
+// Сообщения гостя (LOG(INFO/ERROR)) init пишет в /dev/kmsg. Часть из них идёт
+// мимо перехвата write (внутри libc stdio -> служебный __write), поэтому смотрим
+// сам файл гостевого kmsg — там весь поток сообщений.
+static void report_guest_kmsg(const char* rootfs) {
+    char fp[800];
+    snprintf(fp, sizeof(fp), "%s/dev/kmsg", rootfs);
+    FILE* f = fopen(fp, "r");
+    if (!f) {
+        __android_log_print(ANDROID_LOG_INFO, TAG, "kmsg-diag: %s не читается (errno=%d)", fp, errno);
+        return;
+    }
+    char line[700];
+    int total = 0;
+    int printed = 0;
+    // Печатаем НЕ БОЛЕЕ 25 строк: консольный пайп телефона ограничен (64 КБ), и лишний
+    // вывод блокирует стаб (гость не стартует — лог 13:47, зависание).
+    while (fgets(line, sizeof(line), f)) {
+        total++;
+        if (printed >= 25) continue;
+        if (line[0] == '\n') continue;
+        printed++;
+        // Строку обрезаем: вывод идёт в консольный пайп телефона (64 КБ), лишний вывод
+        // блокирует стаб, и гость не стартует.
+        char cut[260];
+        snprintf(cut, sizeof(cut), "%s", line);
+        __android_log_print(ANDROID_LOG_INFO, TAG, "kmsg-diag: %s", cut);
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "kmsg-diag: всего строк = %d (показано %d)", total,
+                        printed);
+    fclose(f);
+}
+
+// Приводим гостевые *_property_contexts к разделителю ТАБУЛЬНЫЙ: парсер гостя
+// (libpropertyinfoparser, статически влинкован в init) может ждать именно TAB, а в
+// образе GSI между именем и контекстом ПРОБЕЛЫ. Строки он при этом пропускает МОЛЧА
+// (ошибок нет), список свойств выходит пустым, и property_info получается пустым
+// (128 байт) -> "Failed to load serialized property info file".
+static void normalize_property_contexts(const char* rootfs) {
+    char dir[800];
+    snprintf(dir, sizeof(dir), "%s/system/etc/selinux", rootfs);
+    DIR* d = opendir(dir);
+    if (!d) return;
+    struct dirent* e;
+    while ((e = readdir(d)) != nullptr) {
+        if (!strstr(e->d_name, "property_contexts")) continue;
+        char fp[900];
+        snprintf(fp, sizeof(fp), "%s/%s", dir, e->d_name);
+        FILE* f = fopen(fp, "r");
+        if (!f) continue;
+        char tmp[900];
+        snprintf(tmp, sizeof(tmp), "%s.new", fp);
+        FILE* out = fopen(tmp, "w");
+        if (!out) { fclose(f); continue; }
+        char line[1024];
+        int changed = 0;
+        while (fgets(line, sizeof(line), f)) {
+            if (line[0] == '#' || line[0] == '\n') {   // комментарии не трогаем
+                fputs(line, out);
+                continue;
+            }
+            char* p = line;
+            while (*p && *p != ' ' && *p != '\t') p++;   // конец имени
+            if (*p) {
+                char* q = p;
+                while (*q == ' ' || *q == '\t') q++;       // разделитель
+                if (q != p) {
+                    fprintf(out, "%.*s\t%s", (int)(p - line), line, q);
+                    changed++;
+                    continue;
+                }
+            }
+            fputs(line, out);
+        }
+        fclose(f);
+        fclose(out);
+        if (changed) {
+            rename(tmp, fp);
+            __android_log_print(ANDROID_LOG_INFO, TAG,
+                                "propctx: %s — разделитель заменён на TAB (%d строк)", e->d_name,
+                                changed);
+        } else {
+            unlink(tmp);
+        }
+    }
+    closedir(d);
+}
+
 static void prepare_guest_fs(const char* rootfs) {
     if (!rootfs || !rootfs[0]) return;
     char p[700];
 
     // Каталоги и симлинки гостевой ФС создаёт build_guest_layout() по раскладке.
+    normalize_property_contexts(rootfs);
+    test_epoll_support();
+    __android_log_print(ANDROID_LOG_INFO, TAG, "diag: selinux");
     report_guest_selinux(rootfs);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "diag: properties");
+    report_guest_properties(rootfs);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "diag: kmsg");
+    report_guest_kmsg(rootfs);
+    __android_log_print(ANDROID_LOG_INFO, TAG, "diag: libstrings");
+    report_guest_lib_strings(rootfs, "propertyinfo");
+    // Парсер может быть статически слинкован в бинарник init — смотрим и его строки.
+    {
+        char initbin[800];
+        snprintf(initbin, sizeof(initbin), "%s/system/bin/init", rootfs);
+        scan_file_strings(initbin, "init", 40);
+    }
+    __android_log_print(ANDROID_LOG_INFO, TAG, "diag: done");
     // Симлинки гостя внутри /system/etc/selinux (file_contexts и др.) не должны вести
     // в ФС хоста — иначе гость читает чужое (и получает ENOENT).
     fix_guest_symlinks_in(rootfs, "/system/etc/selinux");
@@ -1532,6 +1785,16 @@ int main(int argc, char** argv) {
         snprintf(env_mounts_file, sizeof(env_mounts_file), "A10_MOUNTS_FILE=%s", table_path);
     }
 
+    // Реестр прав гостя (исходные режимы файлов, которые preload расширяет ради записи):
+    // preload читает его по A10_MODES_FILE и возвращает гостю именно исходные права.
+    char env_modes_file[800];
+    env_modes_file[0] = 0;
+    if (rootfs_dir && rootfs_dir[0]) {
+        char modes_path[700];
+        snprintf(modes_path, sizeof(modes_path), "%s/a10_modes", rootfs_dir);
+        snprintf(env_modes_file, sizeof(env_modes_file), "A10_MODES_FILE=%s", modes_path);
+    }
+
     // Подготовка гостевой ФС: политика гостя (/sepolicy и прекомпилированная).
     // Корнем гостя становится rootfs (cwd + A10_ROOTFS для preload'а).
     prepare_guest_fs(rootfs_dir);
@@ -1696,6 +1959,9 @@ int main(int argc, char** argv) {
     }
     if (env_mounts_file[0]) {
         envp[eic++] = env_mounts_file;
+    }
+    if (env_modes_file[0]) {
+        envp[eic++] = env_modes_file;
     }
     envp[eic] = nullptr;
 

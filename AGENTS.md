@@ -38,8 +38,33 @@
 | selinuxfs | гость монтирует сам (`mount … selinuxfs`) → эмулируется: запись/ioctl — успех, `fstatfs` отдаёт magic **из записи таблицы** |
 | logd | сокета logd хоста нет: `connect()` к любому AF_UNIX, которого нет в гостевой ФС, эмулируется успехом, сообщения гостя печатаются в консоль |
 | `/data/data/…/aosp` (хостовый путь) | гость в ФС телефона не попадает: путь вне таблицы → `ENOENT`/`EACCES` |
+| **свойства** | общая область свойств телефона **не используется**: `__system_property_area_init`→0, `__system_property_find`→nullptr, `__system_property_add`/`_get`/`_update` → свой файл гостя `/dev/__properties__/guest_properties` (key=value) |
+| **shared memory гостя** | `memfd_create`/`ashmem_create_region` для имён с «property» → обычный файл в гостевой ФС `/dev/__properties__/<name>` (не память телефона) |
+| **chown гостя** | `fchown/chown/lchown/fchownat` → успех (гость root); файлы без прав на запись расширяются до 0664 |
 
 ### Ключевые технические находки (не терять!)
+- **Запись в консоль гостя — только частями по ≤1024 байт.** Пайп телефона даёт атомарность только на `PIPE_BUF` (4096); большая запись (дамп таблицы гостя ~8 КБ) обрывается на свободном месте, и **весь последующий вывод теряется** (лог 14:55: вторая стадия молчала — не было ни одного лога перехватов). `console_raw()` пишем кусками с повтором.
+- **Трекер fd гостя — только для гостевых путей.** Наш собственный код (файлы свойств гостя, файлы procfs) открывает файлы по **host-путям**; если такие пути попадают в трекер, то относительный `open()` гостя склеивается с host-путём каталога, и путь гостя «заражается». Правило: `track_set_path()` вызываем только для гостевых путей; `fopen()` тоже отслеживает свой fd (`fileno`) и помечает виртуальный файл procfs.
+- **Трекер fd не должен заводить дубль слота.** `close()` гостя часто уходит мимо перехвата (`fclose()` из libc++ зовёт внутренний close) → слот остаётся занятым. Следующий `open()` того же fd добавлял ВТОРОЙ слот, и `track_take_virt()`/`proc_kind_of_fd()` отдавали данные ПРЕДЫДУЩЕГО файла: гость читал пустоту вместо содержимого (`No version present in plat_sepolicy_vers.txt` — fd достался от виртуального `/proc/cmdline`). **Правило: `track_add()` переиспользует слот, если такой fd уже отслеживается** (и чистит виртуальные данные).
+- **Реестр прав гостя** (`a10engine/modes.cpp`, файл `<rootfs>/a10_modes`, env `A10_MODES_FILE`): мы расширяем реальные права файлов до 0664, чтобы гость мог писать, но **запоминаем исходный режим** и в `stat()` показываем гостю ИСХОДНЫЙ (propertyinfoparser требует, чтобы `property_info` не был доступен на запись группе/остальным). Реестр переживает перезапуск приложения.
+- **Файлы гостя должны выглядеть как root-овые.** `propertyinfoparser` (AOSP 10, `system/core/property_service/libpropertyinfoparser/`) при загрузке `property_info` требует:
+  ```c
+  if ((fd_stat.st_uid != 0) || (fd_stat.st_gid != 0) ||
+      ((fd_stat.st_mode & (S_IWGRP | S_IWOTH)) != 0) ||
+      (fd_stat.st_size < sizeof(PropertyInfoArea))) return false;   // -> "Failed to load serialized property info file"
+  ```
+  Мы — обычное приложение (uid приложения), `chown(0,0)` без CAP_CHOWN невозможен, поэтому в stat-семействе гостю подставляется uid=0, gid=0 (см. реестр прав выше).
+- **Проверки доступа SELinux у гостя решаем сами**: `selinux_check_access()` перехватывается и разрешает доступ — ядро хоста не знает гостевых классов (`Unknown class property_service` → `Init cannot set 'ro.bootmode': SELinux permission check failed`).
+- **Линковка перехватов — C, иначе гость их не видит.** Функция, определённая в C++ без `extern "C"`, экспортируется с mangling (`_Z5mountPKc...`) и **не перехватывает** libc-функцию: гость уходит в реальный syscall. Симптом: `=== SIGSYS: syscall 40 -> ENOSYS ===` (40 = `mount` на aarch64) и `Init encountered errors starting first stage, aborting` — гость делает 8 mount'ов, все падают, `CHECKCALL` собирает ошибки → FATAL.
+  - **Правило:** любой перехват имени libc обязан иметь `extern "C"`. Объявления критичных перехватов вынесены в `a10engine/a10engine.h` — если в модуле определение окажется с C++-линковкой, компилятор даст «conflicting declaration» (защита от повтора).
+  - **Проверка после сборки:** `readelf -W --dyn-syms liba10preload.so | grep -w mount` — символ должен быть **без** `_Z`-префикса.
+  - Проверено и исправлено 26 перехватов: `mount`, `umount2`, `ioctl`, `statx`, `lgetxattr`, `fgetxattr`, `lsetxattr`, `setxattr`, `fsetxattr`, `removexattr`, `setfsuid`, `setfsgid`, `capset`, `reboot`, `swapon`, `swapoff`, `settimeofday`, `clock_settime`, `sched_setscheduler`, `init_module`, `delete_module`, `kexec_load`, `adjtimex`, `setpriority`, `syslog`, `pivot_root`, `setdomainname`.
+  - `ioctl` объявлен как в bionic: `int ioctl(int fd, int request, ...)` (не `unsigned long`) — иначе конфликт с `<sys/ioctl.h>`.
+- **Гость читает файлы через fortify**: `fstat` → `__fxstat`, `read` → `__read_chk` — это **внутренние обёртки libc**, мимо нашего перехвата (наши `fstat`/`read` их не видят). Поэтому «нет вызова fstat» в логе ≠ «гость не читал файл».
+- **Сообщения гостя (LOG(INFO/ERROR)) идут в `/dev/kmsg`** (init переводит stdout/stderr на kmsg). Часть из них идёт мимо перехвата `write` (внутри libc stdio → служебный `__write`) и попадает в файл `<rootfs>/dev/kmsg` — **его дампит загрузчик при смерти гостя** (`guest-kmsg:`), а стаб — в начале следующего прогона (то есть дамп стаба показывает сообщения **предыдущего** прогона).
+- **Каждое сообщение в консоль должно кончаться `\n`**: без перевода строки сообщения гостя слипались в одну гигантскую строку, и logcat её обрезал/отбрасывал (лог 13:31: сообщений гостя в logcat не было, хотя на экране они были).
+- **Сокет logd гостя** (`/dev/socket/logdw`): `connect()` к AF_UNIX, которого нет в гостевой ФС, теперь подключает гостя к **socketpair**, а отдельный поток читает сообщения и печатает их в консоль (`[guest log] …`). Раньше `connect()` просто «успевал», запись уходила в никуда — все `LOG()` гостя терялись.
+- **Первая стадия init (AOSP 10)** = `system/core/init/first_stage_init.cpp`: `CHECKCALL` на каждую операцию (mount tmpfs /dev, devpts /dev/pts, proc /proc, sysfs /sys, selinuxfs /sys/fs/selinux, tmpfs /mnt, /apex, /debug_ramdisk; mkdir /dev/pts, /dev/socket, /mnt/vendor, /mnt/product; chmod /proc/cmdline; setgroups; mknod /dev/{kmsg,random,urandom,ptmx,null}). Любая ошибка → `LOG(FATAL) "Init encountered errors starting first stage, aborting"`. Текст ошибок уходит в logd гостя (не видно), спасает только `android_set_abort_message`.
 - **fortify-обёртки bionic**: гость собран с `_FORTIFY_SOURCE` → его `open()` превращается в `__open_2`, который зовёт **внутренний `__openat`** напрямую, минуя `open`/`openat`. Без перехвата `__openat`/`__open_2`/`__openat_2` гость читал файлы **хостовыми** путями (например sha-политики SELinux) и молча получал false.
 - **Двойной перевод**: `fopen` → bionic → наш же `__openat` → host-путь переводится повторно → `ENOENT`. Перевод идемпотентен: путь, уже указывающий внутрь гостевой ФС, не переводится (`host_path_of()`).
 - **SIGSYS**: обработчик, установленный в стабе, при `execve` **сбрасывается** (POSIX) → preload ставит свой обработчик **внутри** процесса init'а. `pkey_alloc` (syscall 219 на aarch64) блокируется seccomp телефона → в обработчике результат подменяется на 0 через `ucontext`.
@@ -78,7 +103,16 @@
 - Окружение гостя: `ANDROID_ROOT`, `PATH`, `LD_LIBRARY_PATH` (только внутри rootfs), `LD_PRELOAD`, `A10_CONSOLE_FD`, `A10_ROOTFS`, `A10_MOUNTS_FILE`; `clearenv()` в preload восстанавливает их.
 - Exec-проба LD_PRELOAD (A/B): ок-файл + маркер в консоли; winner → LD_PRELOAD для init.
 
-### Preload (a10preload.cpp) — эмуляция syscall'ов гостя
+### Структура исходников (`app/src/main/cpp/`)
+| Папка | Что внутри |
+|---|---|
+| `a10engine/` | **движок эмуляции гостя** (LD_PRELOAD `liba10preload.so`), разложен по модулям: `a10engine.h` (общие extern-глобалы, `REAL_FN`, `A10_FAIL`), `table.cpp` (mount-таблица: загрузка/поиск/перевод/сохранение), `paths.cpp` (перевод путей, права, magic ФС), `console.cpp` (консоль гостя, перехват `__android_log_*`/`abort`, `plog`, `trace_slot`), `sockets.cpp` (netlink-эмуляция, logfd, connect/writev/sendto), `devices.cpp` (устройства гостя, трекинг fd/путей, `guest_shared_memory`, `memfd_create`/`ashmem_create_region`), `procfs.cpp` (виртуальные файлы procfs/selinuxfs), `selinux.cpp` (file_contexts гостя, SID-пространство, перехваты гостевой libselinux), `fsops.cpp` (open/stat/access/fopen/chmod/chown…), `syscalls.cpp` (mount/mknod/exec/chdir/clearenv/ioctl/statfs/write/ftruncate/mmap/SIGSYS), `props.cpp` (свойства гостя — свой файл), `globals.cpp` (общие переменные), `init.cpp` (конструктор preload), `mounts.h` (разбор формата mount-таблицы) |
+| `bootstrap/` | `stub_main.cpp` — bootstrap-стаб: скан корня гостевой ФС, симлинки внутрь гостя, установка гостевой политики, сборка таблицы, `A10_MOUNTS_FILE` в env |
+| `host/` | сторона **хоста**: `loader.cpp` (загрузчик/супервизор), `image_extractor.cpp` + `ext4_extract.cpp` (распаковка system.img), `binder_emulator.cpp`, `graphics_bridge.cpp`, `audio_bridge.cpp`, `native-lib.cpp`. `aosp_unpacker.cpp` **не собирается** (нужен libzip, его нет в NDK) |
+
+> `a10preload.cpp` и `stub_main.cpp`/`loader.cpp` разбиты на модули; старый монолит удалён. Перенос сделан скриптом по маркерам функций, поэтому проверять diff глазами обязательно: после `git checkout` прежние незакоммиченные правки откатываются.
+
+### Preload (a10engine/*) — эмуляция syscall'ов гостя
 - Перевод путей по таблице; вне таблицы → `ENOENT`/`EACCES` (в ФС телефона гость не попадает).
 - Перехваты: `open/openat/open64/openat64/__openat/__open_2/__openat_2`, `stat*`, `access`, `readlink`, `opendir`, `fopen*`, `freopen`, `mkdir*`, `rmdir`, `unlink*`, `rename`, `symlink`, `link`, `chmod*`, `chown*`, `truncate`, `mkstemp*`, `execve/execv`, `chdir`, `read/write`, `mount/umount2`, `mknod`, `statfs/fstatfs`, `connect`, `clearenv`, `close`.
 - Эмуляция: `mount`/`mknod` → регистрация в таблице; устройства по major/minor; selinuxfs (запись/ioctl успех, magic из таблицы); procfs-файлы; netlink → unix-socketpair; `clearenv` → восстановление окружения гостя.
@@ -90,8 +124,10 @@
 |---|---|
 | 1. первая (`init`) | ✅ проходит: mount'ы /dev, /dev/pts, /proc, /sys, /sys/fs/selinux, /mnt, /apex, /debug_ramdisk; `mknod` устройств; `execv … second_stage` |
 | 2. `selinux_setup` | ✅ проходит: гостевая политика записана в эмулированный selinuxfs (`/sys/fs/selinux/load`, 343 241 байт), enforce/checkreqprot; `execv … second_stage` |
-| 3. `second_stage` | ✅ **property area инициализировалась** (ошибки больше нет); ❌ падает на `restorecon("/system/bin/init")` → `ENOENT` |
-| 4. restorecon | ⏳ чинится: виртуальные файлы selinuxfs теперь выдаются **по позиции** (иначе гость читал одни и те же первые 16 КБ и не доходил до нужного контекста) |
+| 3. `second_stage` | ⏳ прогон **14:32**: **`property_init` пройден** (property_info загрузился — барьер снят правкой root-владения), свойства ставятся (`ro.build.fingerprint`), `restorecon` идёт, **сокет property-сервиса создан** (`Created socket '/dev/socket/property_service'` — починили перевод пути в `bind()`). ❌ Барьер: `epoll_ctl failed to add fd: Operation not permitted` — гость регистрирует сокет в epoll, EPERM. Добавлена диагностика: `epoll_ctl` перехвачен (лог + тип fd), `socket()`/`bind()` с номерами fd, тест epoll в стабе (`epoll-test:`) — выясняем, блокирует ли хост epoll_ctl или fd не поддерживает epoll. |
+| 4. restorecon | ✅ пройден (13:19): эмуляция `/proc/self/fd/N` (путь гостя из трекера fd) + `lgetfilecon` по правилам гостя |
+| 5. сервисы / servicemanager | ⏳ не начато (дальше — **binder**, `/dev/binder` хоста намеренно не трогаем) |
+| 4. restorecon | ✅ пройден (13:19): эмуляция `/proc/self/fd/N` (путь гостя из трекера fd) + `lgetfilecon` по правилам гостя |
 | 5. сервисы / servicemanager | ⏳ не начато (дальше — **binder**, `/dev/binder` хоста намеренно не трогаем) |
 
 ### Разбор `restorecon failed of /system/bin/init: ENOENT` (01:47)
@@ -104,16 +140,19 @@
 
 ## Следующие шаги
 
-1. **restorecon** — дождаться прогона с выдачей по позиции; если ENOENT останется — смотреть, какие файлы libselinux открывает (лог `open()` покажет).
-2. **init.rc** — в rootfs есть (`/init.rc` в корне гостевой ФС, в таблице есть); гость его проходит, но сервисы из него могут потребовать `/dev/binder` и системных свойств.
-3. **Binder:** второй стадии нужен `/dev/binder` — виртуальная реализация в `binder_emulator.cpp` (симлинк на хостовый binder НЕ создаём).
-4. **procfs:** минимальный набор файлов (`self/*`, `mounts`, `filesystems`) — эмулируется по `fs=proc`.
-5. **ueventd/netlink:** узлы `/dev/*` создаёт гость сам (mknod) — эмуляция работает; реальных uevent-событий нет.
-6. **Свойства:** init читает `/system/build.prop` (в rootfs есть) — проверить `ro.build.version.sdk` и прочие, иначе zygote/system_server не поднимутся.
-7. **SIGSYS-handler — выполнение syscall:** читать `si_call_addr`, декодировать, выполнять в host-контексте (сейчас для pkey_alloc подставляем 0, остальным возвращается `-ENOSYS`).
+1. **Прогон с новым APK** (рефакторинг движка + эмуляция свойств/shared memory/chown): цель — `__system_property_area_init` → property service → servicemanager. Логировать в `log.txt`.
+2. **restorecon** — если ENOENT останется, смотреть, какие файлы libselinux открывает (лог `open()` покажет).
+3. **init.rc** — в rootfs есть (`/init.rc` в корне гостевой ФС, в таблице есть); гость его проходит, но сервисы из него могут потребовать `/dev/binder` и системных свойств.
+4. **Binder:** второй стадии нужен `/dev/binder` — виртуальная реализация в `binder_emulator.cpp` (симлинк на хостовый binder НЕ создаём).
+5. **procfs:** минимальный набор файлов (`self/*`, `mounts`, `filesystems`) — эмулируется по `fs=proc`.
+6. **ueventd/netlink:** узлы `/dev/*` создаёт гость сам (mknod) — эмуляция работает; реальных uevent-событий нет.
+7. **Свойства:** init читает `/system/build.prop` (в rootfs есть) — проверить `ro.build.version.sdk` и прочие, иначе zygote/system_server не поднимутся. Свойства гостя лежат в его файле `/dev/__properties__/guest_properties`, свойства телефона не подмешиваются.
+8. **SIGSYS-handler — выполнение syscall:** читать `si_call_addr`, декодировать, выполнять в host-контексте (сейчас для pkey_alloc подставляем 0, остальным возвращается `-ENOSYS`).
 
 ## История логов (ключевые этапы)
 
+- **13:16** — **первая стадия прошла целиком** (после починки C-линковки): 8 mount'ов, `mknod` устройств, `execv … selinux_setup`; selinuxfs отдал magic из таблицы, политика гостя загрузилась. Барьер — `restorecon` (`readlink("/proc/self/fd/N")` → ENOENT). Починено эмуляцией `/proc/self/fd/N` + трекером путей fd.
+- **13:06** — прогон после рефакторинка движка: гость упал в **первой** стадии («Init encountered errors starting first stage»). Разбор: `mount()` не перехватывался (C++-линковка → символ `_Z5mount...`), 8 mount'ов ушли в реальный syscall → SIGSYS(40) → ENOSYS → `CHECKCALL` → FATAL. Исправлено 26 перехватов, добавлены объявления-перехваты в `a10engine.h` как защита от повтора.
 - **13:40–15:36** — эмуляция вместо блокировок; перехват сообщений гостя (liblog/`android_set_abort_message`), netlink-эмуляция; первая стадия init.
 - **19:29–00:12** — SELinux-политика: precompiled-путь, sha-пары plat/product/system_ext, `secilc` гостя (`-c 31` + `mapping/29.0`), fstatfs→SELINUX_MAGIC.
 - **21:20–22:00** — **mount-таблица**: пути гостя только через таблицу; symlink-цели внутрь гостя; `LD_LIBRARY_PATH` только внутри rootfs; `A10_MOUNTS_FILE` в env.
